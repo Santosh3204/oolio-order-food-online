@@ -1,11 +1,38 @@
+# Local "production-shaped" stack:
+#   redis    shared index store (every API replica reads the same SET)
+#   indexer  one-shot OFFLINE job: big coupon files -> small exact index in redis
+#   api      stateless; never touches the big files
+#
+#   docker compose up -d redis
+#   docker compose run --rm indexer        # once (or on a schedule); ~10 min for the real files
+#   docker compose up -d --build api       # scale: docker compose up -d --scale api=3 (drop ports first)
 services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  indexer:
+    build: .
+    profiles: ["index"]
+    entrypoint: ["/couponindex"]
+    environment: &coupon
+      COUPON_STORE: redis
+      COUPON_REDIS_ADDR: redis:6379
+      # COUPON_FILES: /data/couponbase1.gz,/data/couponbase2.gz,/data/couponbase3.gz
+      COUPON_TMP_DIR: /spill
+    volumes:
+      - spill:/spill          # needs ~3.5 GB free for the real files
+      # - ./data:/data:ro
+    depends_on: [redis]
+
   api:
     build: .
-    ports:
-      - "8080:8080"
+    ports: ["8080:8080"]
     environment:
+      <<: *coupon
       API_KEY: apitest
-      # Defaults to the three S3 coupon files; override with local paths if offline:
-      # COUPON_FILES: /data/couponbase1.gz,/data/couponbase2.gz,/data/couponbase3.gz
-    # volumes:
-    #   - ./data:/data:ro
+      COUPON_AUTOBUILD: "false"   # prod: the index is produced by the indexer job only
+    depends_on: [redis]
+
+volumes:
+  spill:

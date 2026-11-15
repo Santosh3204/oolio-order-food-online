@@ -1,8 +1,6 @@
 package orderfood
 
 import (
-	"strings"
-
 	"github.com/Santosh3204/oolio-order-food-online/pkg/config"
 	"github.com/Santosh3204/oolio-order-food-online/pkg/coupon"
 )
@@ -15,15 +13,9 @@ type Client struct {
 	RouterService  *RouterService
 }
 
-// NewClient initializes all services.
+// NewClient initializes all services; the coupon index is loaded in the background.
 func NewClient() *Client {
-	var sources []coupon.Source
-	for _, loc := range strings.Split(config.CouponFiles, ",") {
-		if loc = strings.TrimSpace(loc); loc != "" {
-			sources = append(sources, coupon.FileSource(loc))
-		}
-	}
-	return NewClientWithCoupons(coupon.NewAsync(sources...))
+	return NewClientWithCoupons(coupon.NewService(config.CouponConfig()))
 }
 
 // NewClientWithCoupons initializes all services with the given coupon checker.

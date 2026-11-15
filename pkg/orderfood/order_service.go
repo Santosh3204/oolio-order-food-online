@@ -4,8 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-
-	"errors"
+	"log"
 
 	"github.com/Santosh3204/oolio-order-food-online/pkg/coupon"
 	"github.com/Santosh3204/oolio-order-food-online/pkg/orderfoodtypes"
@@ -33,8 +32,10 @@ func newOrderID() string {
 func (s *OrderService) placeOrder(c *fiber.Ctx) error {
 	var req orderfoodtypes.OrderReq
 	if err := json.Unmarshal(c.Body(), &req); err != nil {
+		log.Printf("placeOrder: invalid JSON: %v", err)
 		return sendError(c, fiber.StatusBadRequest, "error", "invalid input")
 	}
+	log.Printf("placeOrder: received %d item(s), coupon=%q", len(req.Items), req.CouponCode)
 	if req.Items == nil {
 		return sendError(c, fiber.StatusBadRequest, "error", "items is required")
 	}
@@ -44,12 +45,15 @@ func (s *OrderService) placeOrder(c *fiber.Ctx) error {
 
 	if req.CouponCode != "" {
 		ok, err := s.coupons.Check(req.CouponCode)
-		if errors.Is(err, coupon.ErrNotReady) {
-			return sendError(c, fiber.StatusServiceUnavailable, "error", "coupon service is starting, retry shortly")
+		if err != nil { // index still loading, or shared store unreachable
+			log.Printf("placeOrder: coupon check unavailable: %v", err)
+			return sendError(c, fiber.StatusServiceUnavailable, "error", "coupon service unavailable, retry shortly")
 		}
 		if !ok {
+			log.Printf("placeOrder: coupon %q rejected", req.CouponCode)
 			return sendError(c, fiber.StatusUnprocessableEntity, "validation", "invalid coupon code")
 		}
+		log.Printf("placeOrder: coupon %q accepted", req.CouponCode)
 	}
 
 	products := make([]orderfoodtypes.Product, 0, len(req.Items))
@@ -67,8 +71,10 @@ func (s *OrderService) placeOrder(c *fiber.Ctx) error {
 		products = append(products, p)
 	}
 
+	id := newOrderID()
+	log.Printf("placeOrder: order %s created with %d product(s)", id, len(products))
 	return c.Status(fiber.StatusOK).JSON(orderfoodtypes.Order{
-		ID:       newOrderID(),
+		ID:       id,
 		Items:    req.Items,
 		Products: products,
 	})

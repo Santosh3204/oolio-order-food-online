@@ -1,3 +1,5 @@
 .idea/
 bin/
 *.exe
+coupon-cache.bin*
+data/

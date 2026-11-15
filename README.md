@@ -10,9 +10,7 @@ docker compose up --build
 make test
 ```
 
-Config (env): `SERVER_PORT` (8080), `API_KEY` (apitest), `COUPON_FILES`
-(comma-separated paths or http(s) URLs; `.gz` auto-decompressed; defaults to the three
-challenge S3 files).
+Config (env): `SERVER_PORT` (8080), `API_KEY` (apitest); coupon settings are listed below.
 
 ```
 curl localhost:8080/api/product
@@ -36,32 +34,69 @@ main.go                 wiring / server
 pkg/config              env config
 pkg/orderfood           handlers: product, order, auth, router (+ Client wiring)
 pkg/orderfoodtypes      request/response models
-pkg/coupon              promo-code validation
+pkg/coupon              promo-code validation: indexer, memory/redis index, service
+cmd/couponindex         offline job that builds the coupon index
 ```
 
 ## Coupon validation
 
-A code is valid if its length is 8–10 **and** it appears in at least two of the three coupon files.
+A code is valid if its length is 8-10 **and** it appears in at least two of the three coupon files.
 
-- Files are **streamed** (never fully loaded as text); only lines with valid length are kept.
-- Each code is stored as a 64-bit hash → bitmask of files it appeared in. A code repeated within
-  one file sets the same bit, so it can't count twice. After loading, entries seen in <2 files are
-  dropped, leaving ~16 bytes per valid code in memory.
-- Loading runs in the **background**: the API serves products immediately, and orders with a coupon
-  return 503 until the index is ready (orders without a coupon are unaffected).
-- Trade-off: a 64-bit hash has a negligible but non-zero false-positive chance.
+The files are ~2.1 GB compressed / ~340M codes, so the design separates a heavy **offline** job from
+a light **online** path:
 
-### Scaling / extensibility
+```
+OFFLINE  couponindex job                              ONLINE  API replicas (stateless)
+ 3 big .gz --spill by hash(code)%P--> disk buckets     Service.Check(code)
+            --reduce one bucket at a time-->  exact     -> length pre-filter (no I/O)
+            valid codes --publish atomically--> Index   -> Index.Contains(code)  (memory set or Redis SISMEMBER)
+```
 
-- `coupon.Checker` / `coupon.Validator` are interfaces: swap the in-memory set for Redis, a DB
-  table, or a bloom filter + exact store without touching order code. For multiple replicas,
-  build the index once offline and load it from shared storage rather than every pod
-  re-downloading the files.
-- `Source` abstracts where files come from (local path, URL, could be S3 SDK).
-- Products live in `ProductService` (in-memory seed data); replace with a repository interface
-  backed by a database for real use. Orders are not persisted (the spec only requires a response).
-- Rules (length, min file count) are constants in `pkg/coupon`; promotions beyond validity
-  (discount amounts) would be a separate pricing step after validation.
+- **Exact, bounded memory** (`pkg/coupon/indexer.go`): every source is streamed once (concurrently, with
+  the faster `klauspost` gzip) and spilled to `P` partition files by FNV hash. Equal codes always meet in
+  the same partition, so each partition is reduced independently with a `code -> source bitmask` map.
+  No hashes are stored for the answer, so there are **no false positives**; a code repeated inside one
+  file counts once. Peak RAM ~ total/P entries (64 partitions: a few hundred MB); needs ~3.5 GB temp disk.
+  Raise `COUPON_PARTITIONS` to trade disk files for less RAM.
+- **Build once, serve everywhere**: `cmd/couponindex` publishes the tiny result (8 codes for the real
+  data). API replicas only load/query it and never read the big files, so scaling out is free.
+- **Pluggable store** (`Index` interface): `file` (default; path or URL, e.g. an S3/CDN link the job
+  uploads to) or `redis` (shared SET, O(1) `SISMEMBER`; published via temp key + `RENAME` so readers never
+  see a partial index). Adding SQL/DynamoDB = implement `Contains`.
+- **Non-blocking start**: the API serves immediately and picks the index up in the background (polling
+  every 15 s). Orders with a coupon get 503 until it exists; orders without one are unaffected.
+- `COUPON_AUTOBUILD` (default `true`): if no index exists the API builds it itself - handy locally,
+  but set `false` in production so only the indexer job builds (otherwise every replica would).
+
+### Run it
+
+Local, zero setup (first start builds `data/coupon-index.txt`, ~10 min; later starts are instant):
+```
+make run
+```
+Production-shaped, locally (Redis + one-shot indexer + stateless API):
+```
+docker compose up -d redis
+docker compose --profile index run --rm indexer
+docker compose up -d --build api
+```
+Offline job only, file store: `make index`.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `COUPON_STORE` | `file` | `file` or `redis` |
+| `COUPON_INDEX` | `data/coupon-index.txt` | file store path or URL |
+| `COUPON_REDIS_ADDR` / `COUPON_REDIS_KEY` | `localhost:6379` / `coupons:valid` | redis store |
+| `COUPON_FILES` | the 3 challenge S3 files | sources (paths/URLs, `.gz` ok) |
+| `COUPON_TMP_DIR` | `data/tmp` | spill space for the build |
+| `COUPON_PARTITIONS` | `64` | build partitions |
+| `COUPON_AUTOBUILD` | `true` | API builds a missing index itself |
+
+### Extending
+- New rule (e.g. different length / file count): constants in `pkg/coupon/coupon.go`.
+- Discounts: a pricing step after validation (the spec's `Order` has no price fields, so a valid
+  coupon is only validated, not applied).
+- Refresh: re-run the indexer on a schedule; the swap is atomic.
 
 ## Assumptions
 

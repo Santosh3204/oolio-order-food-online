@@ -1,6 +1,7 @@
 package orderfood
 
 import (
+	"log"
 	"strconv"
 
 	"github.com/Santosh3204/oolio-order-food-online/pkg/orderfoodtypes"
@@ -38,18 +39,23 @@ func (s *ProductService) Get(id string) (orderfoodtypes.Product, bool) {
 
 // listProducts handles GET /product.
 func (s *ProductService) listProducts(c *fiber.Ctx) error {
+	log.Printf("listProducts: returning %d products", len(s.products))
 	return c.Status(fiber.StatusOK).JSON(s.products)
 }
 
 // getProduct handles GET /product/:productId.
 func (s *ProductService) getProduct(c *fiber.Ctx) error {
 	id := c.Params("productId")
+	log.Printf("getProduct: id=%q", id)
 	if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+		log.Printf("getProduct: invalid id %q", id)
 		return sendError(c, fiber.StatusBadRequest, "error", "invalid ID supplied")
 	}
 	p, ok := s.Get(id)
 	if !ok {
+		log.Printf("getProduct: product %q not found", id)
 		return sendError(c, fiber.StatusNotFound, "error", "product not found")
 	}
+	log.Printf("getProduct: found %q (%s)", id, p.Name)
 	return c.Status(fiber.StatusOK).JSON(p)
 }

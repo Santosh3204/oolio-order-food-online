@@ -65,3 +65,33 @@ func (r *RedisIndex) Save(codes []string) error {
 
 // Close releases the connection.
 func (r *RedisIndex) Close() error { return r.client.Close() }
+
+// MaxSnapshot is the largest valid-set size an API instance will copy into its
+// own memory; bigger sets are queried in Redis directly (SISMEMBER).
+const MaxSnapshot = 1_000_000
+
+// Snapshot copies the whole set into memory (ok=false if it is larger than max).
+// Used so the request path never touches the network.
+func (r *RedisIndex) Snapshot(max int64) (*MemoryIndex, bool, error) {
+	c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	n, err := r.client.SCard(c, r.key).Result()
+	if err != nil {
+		return nil, false, err
+	}
+	if n == 0 {
+		return nil, false, ErrNotReady
+	}
+	if n > max {
+		return nil, false, nil
+	}
+	var codes []string
+	it := r.client.SScan(c, r.key, 0, "", 1000).Iterator()
+	for it.Next(c) {
+		codes = append(codes, it.Val())
+	}
+	if err := it.Err(); err != nil {
+		return nil, false, err
+	}
+	return NewMemoryIndex(codes), true, nil
+}

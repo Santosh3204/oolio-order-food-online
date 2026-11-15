@@ -2,8 +2,10 @@ package config
 
 import (
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Santosh3204/oolio-order-food-online/pkg/coupon"
 )
@@ -22,6 +24,13 @@ func getenvInt(key string, def int) int {
 	return def
 }
 
+func getenvIntAllowZero(key string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(key)); err == nil && n >= 0 {
+		return n
+	}
+	return def
+}
+
 const defaultCouponFiles = "https://orderfoodonline-files.s3.ap-southeast-2.amazonaws.com/couponbase1.gz," +
 	"https://orderfoodonline-files.s3.ap-southeast-2.amazonaws.com/couponbase2.gz," +
 	"https://orderfoodonline-files.s3.ap-southeast-2.amazonaws.com/couponbase3.gz"
@@ -31,6 +40,12 @@ var (
 	ServerPort    = getenv("SERVER_PORT", "8080")
 	// APIKey is the key expected in the `api_key` header of secured endpoints.
 	APIKey = getenv("API_KEY", "apitest")
+
+	// Per-client limit on POST /order (also throttles coupon-code guessing).
+	RateLimitPerMin = getenvInt("RATE_LIMIT_PER_MIN", 60)
+	// Only set true behind a trusted reverse proxy that appends to X-Forwarded-For
+	// (nginx in docker-compose does); otherwise clients could spoof their identity.
+	RateLimitTrustProxy = getenv("RATE_LIMIT_TRUST_PROXY", "false") == "true"
 )
 
 // CouponConfig reads the coupon settings from the environment.
@@ -42,6 +57,8 @@ var (
 //	COUPON_FILES        comma-separated source files/URLs  (default: the 3 challenge S3 files)
 //	COUPON_TMP_DIR      spill dir for the offline build    (default data/tmp)
 //	COUPON_PARTITIONS   build partitions                   (default 64)
+//	COUPON_BUILD_WORKERS partitions reduced in parallel    (default min(4, CPUs))
+//	COUPON_REFRESH_SECONDS reload the index this often     (default 60, 0 = never)
 //	COUPON_AUTOBUILD    API builds a missing index itself  (default true; set false in prod)
 func CouponConfig() coupon.Config {
 	var sources []string
@@ -59,6 +76,8 @@ func CouponConfig() coupon.Config {
 		Sources:       sources,
 		TmpDir:        getenv("COUPON_TMP_DIR", "data/tmp"),
 		Partitions:    getenvInt("COUPON_PARTITIONS", 64),
+		Workers:       getenvInt("COUPON_BUILD_WORKERS", min(4, runtime.NumCPU())),
+		Refresh:       time.Duration(getenvIntAllowZero("COUPON_REFRESH_SECONDS", 60)) * time.Second,
 		AutoBuild:     getenv("COUPON_AUTOBUILD", "true") != "false",
 	}
 }

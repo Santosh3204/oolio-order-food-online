@@ -12,8 +12,8 @@ export default function App() {
   const [coupon, setCoupon] = useState('') // applied (pending server validation)
   const [couponError, setCouponError] = useState('')
   const [placing, setPlacing] = useState(false)
-  const [order, setOrder] = useState(null)
-  const [orderError, setOrderError] = useState('')
+  // result of the last "Place order": { ok: true, order, coupon, total } | { ok: false, status, title, message }
+  const [result, setResult] = useState(null)
 
   useEffect(() => {
     listProducts().then(setProducts).catch((e) => setLoadError(e.message))
@@ -49,23 +49,41 @@ export default function App() {
     setCouponError('')
   }
 
+  const failureTitle = (status) =>
+    ({
+      400: 'Invalid order',
+      401: 'Not authorized',
+      403: 'Access denied',
+      422: 'Order rejected',
+      503: 'Service unavailable',
+    })[status] || 'Order failed'
+
   const submit = async () => {
     setPlacing(true)
-    setOrderError('')
-    setOrder(null)
+    setResult(null)
+    const snapshot = { lines, total, coupon }
     try {
       const res = await placeOrder({
         items: lines.map((l) => ({ productId: l.id, quantity: l.quantity })),
         couponCode: coupon,
       })
-      setOrder({ ...res, coupon })
+      setResult({ ok: true, order: res, ...snapshot })
       setCart({})
     } catch (err) {
       if (coupon && err.status === 422 && /coupon/i.test(err.message)) {
-        setCouponError(err.message) // keep the cart, let the user fix the code
-      } else {
-        setOrderError(err.status === 503 ? 'Coupon service is starting up, please retry shortly.' : err.message)
+        setCouponError(err.message) // also flag the coupon field
       }
+      const network = err.status === undefined
+      setResult({
+        ok: false,
+        status: err.status,
+        title: network ? 'Cannot reach the server' : failureTitle(err.status),
+        message: network
+          ? 'Check that the API is running and try again.'
+          : err.status === 503
+            ? 'The coupon service is starting up. Please retry in a moment.'
+            : err.message,
+      })
     } finally {
       setPlacing(false)
     }
@@ -140,20 +158,38 @@ export default function App() {
           <button className="primary" onClick={submit} disabled={lines.length === 0 || placing}>
             {placing ? 'Placing…' : 'Place order'}
           </button>
-          {orderError && <p className="error">{orderError}</p>}
         </aside>
       </main>
 
-      {order && (
-        <section className="confirmation">
-          <h2>✅ Order placed</h2>
-          <p>Order ID: <code>{order.id}</code></p>
-          {order.coupon && <p className="ok">Coupon <b>{order.coupon}</b> accepted.</p>}
-          <ul>
-            {order.items.map((it, i) => (
-              <li key={it.productId}>{it.quantity} × {order.products[i]?.name ?? `product ${it.productId}`}</li>
-            ))}
-          </ul>
+      {result && (
+        <section className={`result ${result.ok ? 'success' : 'failure'}`} role="status" aria-live="polite">
+          <button className="close" onClick={() => setResult(null)} aria-label="Dismiss">×</button>
+          {result.ok ? (
+            <>
+              <h2>✅ Order placed successfully</h2>
+              <p>Order ID: <code>{result.order.id}</code></p>
+              <ul>
+                {result.order.items.map((it, i) => {
+                  const p = result.order.products[i]
+                  return (
+                    <li key={`${it.productId}-${i}`}>
+                      <span>{it.quantity} × {p?.name ?? `product ${it.productId}`}</span>
+                      <span>{p ? money(p.price * it.quantity) : ''}</span>
+                    </li>
+                  )
+                })}
+              </ul>
+              <p className="sum"><span>Total</span><strong>{money(result.total)}</strong></p>
+              {result.coupon && <p>Coupon <b>{result.coupon}</b> was accepted.</p>}
+            </>
+          ) : (
+            <>
+              <h2>❌ {result.title}</h2>
+              <p>{result.message}</p>
+              {result.status && <p className="muted">HTTP status {result.status}</p>}
+              <p className="muted">Your cart has not been changed — fix the problem and place the order again.</p>
+            </>
+          )}
         </section>
       )}
     </div>

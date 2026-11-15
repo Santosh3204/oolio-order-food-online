@@ -22,13 +22,13 @@ import (
 //  1. Spill: every source is streamed ONCE (concurrently). Each code of valid
 //     length goes to spill file <tmp>/p<partition>-s<source> where partition =
 //     FNMA(code) % partitions. Equal codes always land in the same partition.
-//  2. Reduce: partitions are processed one at a time; within a partition a map
-//     code -> bitmask-of-sources is built and codes with >= MinFiles bits are
-//     kept. Peak memory ~ (total codes / partitions) entries.
+//  2. Reduce: partitions are processed `workers` at a time; within a partition a
+//     map code -> bitmask-of-sources is built and codes with >= MinFiles bits are
+//     kept. Peak memory ~ workers x (total codes / partitions) entries.
 //
 // For the real ~340M-code input: ~3.4 GB temporary disk and, with 64
 // partitions, a few hundred MB RAM. Raise `partitions` to lower memory further.
-func BuildIndex(sources []Source, tmpDir string, partitions int) ([]string, error) {
+func BuildIndex(sources []Source, tmpDir string, partitions, workers int) ([]string, error) {
 	if len(sources) > 32 {
 		return nil, fmt.Errorf("at most 32 sources supported")
 	}
@@ -69,17 +69,44 @@ func BuildIndex(sources []Source, tmpDir string, partitions int) ([]string, erro
 		}
 	}
 
-	// 2. reduce, one partition at a time
-	var valid []string
+	// 2. reduce: `workers` partitions at a time (peak RAM ~ workers x partition size)
+	if workers < 1 {
+		workers = 1
+	}
+	var (
+		valid []string
+		mu    sync.Mutex
+		done  int
+		first error
+		jobs  = make(chan int)
+		rwg   sync.WaitGroup
+	)
+	for w := 0; w < workers; w++ {
+		rwg.Add(1)
+		go func() {
+			defer rwg.Done()
+			for p := range jobs {
+				got, err := reduce(work, p, len(sources))
+				mu.Lock()
+				if err != nil && first == nil {
+					first = err
+				}
+				valid = append(valid, got...)
+				done++
+				if done%16 == 0 || done == partitions {
+					log.Printf("coupon indexer: reduced %d/%d partitions, %d valid so far", done, partitions, len(valid))
+				}
+				mu.Unlock()
+			}
+		}()
+	}
 	for p := 0; p < partitions; p++ {
-		got, err := reduce(work, p, len(sources))
-		if err != nil {
-			return nil, err
-		}
-		valid = append(valid, got...)
-		if (p+1)%16 == 0 || p == partitions-1 {
-			log.Printf("coupon indexer: reduced %d/%d partitions, %d valid so far", p+1, partitions, len(valid))
-		}
+		jobs <- p
+	}
+	close(jobs)
+	rwg.Wait()
+	if first != nil {
+		return nil, first
 	}
 	slices.Sort(valid)
 	return valid, nil

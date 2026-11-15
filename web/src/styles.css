@@ -9,9 +9,8 @@ header h1 { margin: 8px 0 20px; }
 main { display:grid; grid-template-columns: 1fr 340px; gap: 20px; align-items:start; }
 @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
 h2 { margin: 0 0 12px; font-size: 1.1rem; }
-.menu, .cart, .confirmation { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
-.confirmation { margin-top:20px; }
-.products, .lines, .confirmation ul { list-style:none; margin:0; padding:0; }
+.menu, .cart, .result { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
+.products, .lines, .result ul { list-style:none; margin:0; padding:0; }
 .product { display:flex; justify-content:space-between; align-items:center; padding:12px 0; border-bottom:1px solid var(--border); }
 .product:last-child { border-bottom:none; }
 .tag { margin-left:8px; font-size:.75rem; color:var(--muted); border:1px solid var(--border); padding:1px 8px; border-radius:99px; }
@@ -33,3 +32,13 @@ input { flex:1; min-width:0; font:inherit; padding:8px 10px; border-radius:8px; 
 .error { color:var(--err); margin:6px 0 0; font-size:.9rem; }
 .ok { color:var(--ok); margin:6px 0 0; font-size:.9rem; }
 code { background:var(--bg); padding:2px 6px; border-radius:6px; }
+
+.result { position:relative; margin-top:20px; border-left-width:6px; }
+.result.success { border-left-color:var(--ok); }
+.result.failure { border-left-color:var(--err); }
+.result h2 { margin-top:0; }
+.result.success h2 { color:var(--ok); }
+.result.failure h2 { color:var(--err); }
+.result li, .result .sum { display:flex; justify-content:space-between; padding:3px 0; }
+.result .sum { border-top:1px solid var(--border); margin-top:8px; padding-top:8px; }
+.result .close { position:absolute; top:8px; right:10px; border:none; background:none; font-size:1.4rem; line-height:1; padding:2px 8px; color:var(--muted); }

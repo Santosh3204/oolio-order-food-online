@@ -59,3 +59,25 @@ func TestAPI(t *testing.T) {
 		}
 	}
 }
+
+func TestOrderRateLimit(t *testing.T) {
+	app := fiber.New()
+	app.Post("/o", orderLimiter(3, true), func(c *fiber.Ctx) error { return c.SendStatus(200) })
+	hit := func(xff string) int {
+		req := httptest.NewRequest("POST", "/o", nil)
+		req.Header.Set("X-Forwarded-For", xff)
+		resp, _ := app.Test(req)
+		return resp.StatusCode
+	}
+	for i := 0; i < 3; i++ {
+		if got := hit("spoof, 1.1.1.1"); got != 200 {
+			t.Fatalf("request %d: %d", i, got)
+		}
+	}
+	if got := hit("different-spoof, 1.1.1.1"); got != 429 { // spoofing the left side must not help
+		t.Fatalf("want 429, got %d", got)
+	}
+	if got := hit("2.2.2.2"); got != 200 { // another client is unaffected
+		t.Fatalf("other client got %d", got)
+	}
+}

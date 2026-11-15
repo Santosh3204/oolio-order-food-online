@@ -2,9 +2,11 @@ package coupon
 
 import (
 	"io"
+	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func src(s string) Source {
@@ -17,7 +19,7 @@ func TestBuildIndex(t *testing.T) {
 			src("HAPPYHRS\nFIFTYOFF\nSUPER100\nSHORT\nTOOLONGCODE1\nONLYONE12\nDUPLICATE\nDUPLICATE\n"),
 			src("HAPPYHRS\nFIFTYOFF\nHAPPYHRS\n"),
 			src("SUPER100\nSUPER100\nFIFTYOFF\n"),
-		}, t.TempDir(), parts)
+		}, t.TempDir(), parts, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -29,7 +31,7 @@ func TestBuildIndex(t *testing.T) {
 }
 
 func TestSameFileTwiceDoesNotCount(t *testing.T) {
-	got, _ := BuildIndex([]Source{src("DUPLICATE\nDUPLICATE\n"), src("OTHERCODE\n")}, t.TempDir(), 4)
+	got, _ := BuildIndex([]Source{src("DUPLICATE\nDUPLICATE\n"), src("OTHERCODE\n")}, t.TempDir(), 4, 2)
 	if len(got) != 0 {
 		t.Fatalf("got %v", got)
 	}
@@ -70,7 +72,7 @@ func TestBuildAutoPublishesFile(t *testing.T) {
 	if err := SaveIndexFile(b, []string{"HAPPYHRS", "ONLYINBBB"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{Store: "file", IndexPath: dir + "/out.txt", Sources: []string{a, b}, TmpDir: dir + "/tmp", Partitions: 8}
+	cfg := Config{Store: "file", IndexPath: dir + "/out.txt", Sources: []string{a, b}, TmpDir: dir + "/tmp", Partitions: 8, Workers: 2}
 	if n, err := Build(cfg); err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
@@ -81,4 +83,35 @@ func TestBuildAutoPublishesFile(t *testing.T) {
 	if ok, _ := idx.Contains("HAPPYHRS"); !ok {
 		t.Fatal("expected HAPPYHRS valid")
 	}
+}
+
+func TestServiceRefreshPicksUpNewIndexAndKeepsLastGoodOnFailure(t *testing.T) {
+	path := t.TempDir() + "/idx.txt"
+	if err := SaveIndexFile(path, []string{"HAPPYHRS"}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewService(Config{Store: "file", IndexPath: path, Refresh: 20 * time.Millisecond})
+	waitFor(t, func() bool { ok, err := s.Check("HAPPYHRS"); return err == nil && ok })
+
+	if err := SaveIndexFile(path, []string{"HAPPYHRS", "FIFTYOFF"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { ok, _ := s.Check("FIFTYOFF"); return ok })
+
+	os.Remove(path) // simulate the store going away: last good index must keep serving
+	time.Sleep(100 * time.Millisecond)
+	if ok, err := s.Check("FIFTYOFF"); !ok || err != nil {
+		t.Fatalf("lost last-good index: ok=%v err=%v", ok, err)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met in time")
 }

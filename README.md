@@ -80,6 +80,19 @@ OFFLINE  couponindex job                              ONLINE  API replicas (stat
 - **Pluggable store** (`Index` interface): `file` (default; path or URL, e.g. an S3/CDN link the job
   uploads to) or `redis` (shared SET, O(1) `SISMEMBER`; published via temp key + `RENAME` so readers never
   see a partial index). Adding SQL/DynamoDB = implement `Contains`.
+- **No network on the hot path**: each API instance holds the (tiny) valid set in memory - copied from
+  Redis, or read from the index file - so `Check` is a length test + map lookup (~14 ns, 0 allocs; see
+  `go test ./pkg/coupon -bench .`). Redis is only read at start and on refresh, so a Redis outage or
+  latency spike does not affect orders; the last good index keeps serving. Sets larger than
+  `MaxSnapshot` (1M codes) are queried live in Redis instead.
+- **Self-refreshing**: instances reload the index every `COUPON_REFRESH_SECONDS` (default 60), so a
+  re-run of the indexer is picked up with no restart. A failed refresh keeps the previous index.
+- **Parallel reduce**: `COUPON_BUILD_WORKERS` partitions are reduced at once (peak RAM ~ workers x
+  partition size; raise `COUPON_PARTITIONS` if you raise workers).
+- **Rate limiting**: `POST /order` is limited per client (`RATE_LIMIT_PER_MIN`, default 60) before auth,
+  which also throttles coupon-code guessing; excess requests get 429. Behind a reverse proxy set
+  `RATE_LIMIT_TRUST_PROXY=true` (compose does) so the client address comes from the proxy-appended
+  last `X-Forwarded-For` entry; leave it `false` when exposed directly, otherwise clients could spoof it.
 - **Non-blocking start**: the API serves immediately and picks the index up in the background (polling
   every 15 s). Orders with a coupon get 503 until it exists; orders without one are unaffected.
 - `COUPON_AUTOBUILD` (default `true`): if no index exists the API builds it itself - handy locally,
@@ -108,6 +121,10 @@ Offline job only, file store: `make index`.
 | `COUPON_TMP_DIR` | `data/tmp` | spill space for the build |
 | `COUPON_PARTITIONS` | `64` | build partitions |
 | `COUPON_AUTOBUILD` | `true` | API builds a missing index itself |
+| `COUPON_BUILD_WORKERS` | `min(4, CPUs)` | partitions reduced in parallel |
+| `COUPON_REFRESH_SECONDS` | `60` | index reload interval (`0` = never) |
+| `RATE_LIMIT_PER_MIN` | `60` | per-client limit on `POST /order` |
+| `RATE_LIMIT_TRUST_PROXY` | `false` | trust the last `X-Forwarded-For` entry |
 
 ### Extending
 - New rule (e.g. different length / file count): constants in `pkg/coupon/coupon.go`.

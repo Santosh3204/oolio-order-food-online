@@ -20,6 +20,7 @@ services:
       COUPON_REDIS_ADDR: redis:6379
       # COUPON_FILES: /data/couponbase1.gz,/data/couponbase2.gz,/data/couponbase3.gz
       COUPON_TMP_DIR: /spill
+      COUPON_BUILD_WORKERS: "4"
     volumes:
       - spill:/spill          # needs ~3.5 GB free for the real files
       # - ./data:/data:ro
@@ -31,6 +32,7 @@ services:
     environment:
       <<: *coupon
       API_KEY: apitest
+      RATE_LIMIT_TRUST_PROXY: "true"   # api is only reachable via nginx / trusted network
       COUPON_AUTOBUILD: "false"   # prod: the index is produced by the indexer job only
     depends_on: [redis]
 

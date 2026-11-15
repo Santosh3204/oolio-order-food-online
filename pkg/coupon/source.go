@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -53,7 +54,7 @@ func get(url string, offset int64) (io.ReadCloser, error) {
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +80,22 @@ type resumeReader struct {
 	offset int64
 }
 
-const maxResumes = 20
+// maxResumes with exponential backoff (1,2,4,...,30s cap) tolerates a network/DNS
+// outage of roughly 15 minutes before giving up. The counter resets whenever bytes flow again.
+const maxResumes = 40
+
+// httpClient bounds connection setup so a dead network fails fast (and is retried)
+// instead of hanging; there is deliberately no overall timeout (downloads are GBs).
+var httpClient = &http.Client{Transport: &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	TLSHandshakeTimeout:   15 * time.Second,
+	ResponseHeaderTimeout: 30 * time.Second,
+}}
+
+func backoff(attempt int) time.Duration {
+	return min(time.Second<<min(attempt, 5), 30*time.Second)
+}
 
 func (r *resumeReader) Read(p []byte) (int, error) {
 	for attempt := 0; ; attempt++ {
@@ -93,7 +109,7 @@ func (r *resumeReader) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		time.Sleep(time.Duration(min(attempt+1, 10)) * time.Second)
+		time.Sleep(backoff(attempt))
 		body, gerr := get(r.url, r.offset)
 		if gerr != nil {
 			if attempt+1 >= maxResumes {

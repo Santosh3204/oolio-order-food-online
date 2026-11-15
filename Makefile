@@ -12,7 +12,6 @@ test:
 # Use docker's built-in builder, not whatever buildx builder happens to be selected globally
 # (a stale docker-container builder breaks `docker compose build` after WSL/Docker Desktop restarts).
 export BUILDX_BUILDER ?= default
-export COMPOSE_BAKE ?= false
 .PHONY: docker-build docker-up docker-index docker-down docker-logs docker-clean docker-all
 docker-build:   ## build the images (api + indexer)
 	docker compose build

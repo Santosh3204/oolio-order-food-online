@@ -98,6 +98,16 @@ Offline job only, file store: `make index`.
   coupon is only validated, not applied).
 - Refresh: re-run the indexer on a schedule; the swap is atomic.
 
+## Troubleshooting
+
+- `dial tcp: lookup ...s3... no such host` / `server misbehaving` in the indexer log: a transient DNS or
+  network failure (VPN/WSL/Docker Desktop). Downloads resume automatically from the last byte with
+  exponential backoff (up to ~15 min of outage); no action needed. If it never recovers, set a
+  resolver for the indexer in `docker-compose.yaml` (`dns: ["<your corporate DNS>"]`) or download the
+  files once and point `COUPON_FILES` at local copies.
+- `docker compose build` fails booting `multi-platform-builder`: the Makefile uses buildx's `default`
+  builder; for raw compose commands run `docker buildx use default`.
+
 ## Assumptions
 
 - The spec has no pricing in `Order`, so a valid coupon is only validated, not applied.

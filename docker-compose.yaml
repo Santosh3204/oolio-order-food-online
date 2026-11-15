@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      API_KEY: apitest
+      # Defaults to the three S3 coupon files; override with local paths if offline:
+      # COUPON_FILES: /data/couponbase1.gz,/data/couponbase2.gz,/data/couponbase3.gz
+    # volumes:
+    #   - ./data:/data:ro

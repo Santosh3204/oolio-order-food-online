@@ -1,0 +1,148 @@
+openapi: 3.1.0
+info:
+  title: Order Food Online - OpenAPI 3.1
+  description: |-
+    This is a e-commerce API based on the OpenAPI 3.1 specification.
+
+    Use API key `apitest`
+  version: 1.0.0
+servers:
+  - url: https://orderfoodonline.deno.dev/api
+tags:
+  - name: product
+    description: Everything about products
+  - name: order
+    description: Place Orders
+paths:
+  /product:
+    get:
+      tags: [product]
+      summary: List products
+      description: Get all products available for order
+      operationId: listProducts
+      responses:
+        '200':
+          description: successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Product'
+  /product/{productId}:
+    get:
+      tags: [product]
+      summary: Find product by ID
+      description: Returns a single product
+      operationId: getProduct
+      parameters:
+        - name: productId
+          in: path
+          description: ID of product to return
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          description: Invalid ID supplied
+        '404':
+          description: Product not found
+  /order:
+    post:
+      tags: [order]
+      summary: Place an order
+      description: Place a new order in the store
+      operationId: placeOrder
+      security:
+        - api_key: ["create_order"]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderReq'
+      responses:
+        '200':
+          description: successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '422':
+          description: Validation exception
+components:
+  schemas:
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          examples: ["0000-0000-0000-0000"]
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              productId:
+                type: string
+              quantity:
+                type: integer
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/Product'
+    OrderReq:
+      type: object
+      properties:
+        couponCode:
+          type: string
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              productId:
+                type: string
+              quantity:
+                type: integer
+            required: [productId, quantity]
+      required: [items]
+    Product:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        price:
+          type: number
+          format: float
+        category:
+          type: string
+    ApiResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          format: int32
+        type:
+          type: string
+        message:
+          type: string
+  securitySchemes:
+    api_key:
+      type: apiKey
+      name: api_key
+      in: header

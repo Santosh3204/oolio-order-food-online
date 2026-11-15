@@ -19,6 +19,22 @@ curl -X POST localhost:8080/api/order -H 'api_key: apitest' -H 'Content-Type: ap
   -d '{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":2}]}'
 ```
 
+## Frontend (React)
+
+`web/` is a small React + Vite app: browse the menu, build a cart, add a promo code, place the order.
+
+```
+make run          # terminal 1: API on :8080
+make web-install && make web-dev    # terminal 2: UI on http://localhost:5173
+# or, with docker: make docker-all  -> UI on http://localhost:3000
+```
+
+The UI calls relative `/api/...` URLs; Vite (dev) and nginx (docker) proxy them to the API, so no CORS
+config is needed. The API key defaults to `apitest` (`VITE_API_KEY` to override at build time).
+The spec has no "validate coupon" endpoint, so **Apply** only checks the format (8-10 letters/digits);
+the server verifies the code when the order is placed, and a rejected code is shown next to the input
+with the cart kept intact.
+
 ## Status codes
 
 | Endpoint | Codes |
@@ -36,6 +52,7 @@ pkg/orderfood           handlers: product, order, auth, router (+ Client wiring)
 pkg/orderfoodtypes      request/response models
 pkg/coupon              promo-code validation: indexer, memory/redis index, service
 cmd/couponindex         offline job that builds the coupon index
+web/                    React frontend (Vite)
 ```
 
 ## Coupon validation

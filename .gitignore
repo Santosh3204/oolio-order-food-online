@@ -3,3 +3,5 @@ bin/
 *.exe
 coupon-cache.bin*
 data/
+web/node_modules/
+web/dist/

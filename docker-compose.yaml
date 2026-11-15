@@ -34,5 +34,10 @@ services:
       COUPON_AUTOBUILD: "false"   # prod: the index is produced by the indexer job only
     depends_on: [redis]
 
+  web:
+    build: ./web
+    ports: ["3000:80"]      # http://localhost:3000 (nginx serves the React build, proxies /api to api)
+    depends_on: [api]
+
 volumes:
   spill:

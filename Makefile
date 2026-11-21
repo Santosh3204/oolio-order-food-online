@@ -1,4 +1,4 @@
-.PHONY: run index build test docker-redis web-install web-dev web-build
+.PHONY: run index build test demo quickstart smoke bench bench-build loadtest docker-redis web-install web-dev web-build
 run:            ## API; builds ./data/coupon-index.txt itself on first start if missing (slow, dev only)
 	go run .
 index:          ## offline job: build the coupon index once (file store by default)
@@ -7,6 +7,20 @@ build:
 	go build -o bin/server . && go build -o bin/couponindex ./cmd/couponindex
 test:
 	go test ./...
+
+# ---- try it in seconds (tiny generated coupon files, no 2 GB download) ----
+demo:           ## sample data -> index -> API -> smoke test -> stop (one command)
+	./scripts/demo.sh
+quickstart:     ## same, but leave the API running on :8080 (then `make smoke` in another shell)
+	./scripts/demo.sh serve
+smoke:          ## end-to-end checks against a running API (BASE_URL, API_KEY overridable)
+	./scripts/smoke.sh
+bench:          ## lookup micro-benchmarks (+ redis one if available)
+	go test ./test/coupon -run xxx -bench Check -benchmem
+bench-build:    ## offline build: time + peak heap on generated data (BENCH_CODES=N per source, default 1M)
+	go test ./test/coupon -run xxx -bench BuildIndex -benchtime 1x
+loadtest:       ## POST /api/order load against a running API: rps + latency percentiles
+	go run ./cmd/loadtest -c 64 -d 10s
 
 # ---- frontend (React + Vite, ./web) ----
 web-install:    ## install frontend dependencies

@@ -1,11 +1,16 @@
 package coupon_test
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/Santosh3204/oolio-order-food-online/pkg/coupon"
+	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -57,5 +62,74 @@ func TestResumeAfterDroppedConnection(t *testing.T) {
 	got, err := io.ReadAll(rc)
 	if err != nil || string(got) != data {
 		t.Fatalf("len=%d want=%d err=%v", len(got), len(data), err)
+	}
+}
+
+func readAll(t *testing.T, loc string) string {
+	t.Helper()
+	rc, err := coupon.FileSource(loc)()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close() }()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// Compression is chosen by extension through the codec registry.
+func TestCodecs(t *testing.T) {
+	const data = "ABCDEFGH\nIJKLMNOP\n"
+	dir := t.TempDir()
+
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write([]byte(data))
+	_ = zw.Close()
+
+	var zs bytes.Buffer
+	enc, _ := zstd.NewWriter(&zs)
+	_, _ = enc.Write([]byte(data))
+	_ = enc.Close()
+
+	files := map[string][]byte{"a.txt": []byte(data), "a.gz": gz.Bytes(), "a.zst": zs.Bytes(), "a.GZ": gz.Bytes()}
+	for name, content := range files {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := readAll(t, p); got != data {
+			t.Errorf("%s: got %q", name, got)
+		}
+	}
+}
+
+// A new format plugs in without touching the indexer.
+func TestRegisterCodec(t *testing.T) {
+	coupon.RegisterCodec(".upper", func(r io.Reader) (io.ReadCloser, error) {
+		b, err := io.ReadAll(r)
+		return io.NopCloser(bytes.NewReader(bytes.ToUpper(b))), err
+	})
+	p := filepath.Join(t.TempDir(), "x.upper")
+	if err := os.WriteFile(p, []byte("abcdefgh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, p); got != "ABCDEFGH\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// Pre-signed URLs carry a query string after the extension.
+func TestCodecIgnoresURLQuery(t *testing.T) {
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write([]byte("ABCDEFGH\n"))
+	_ = zw.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(gz.Bytes()) }))
+	defer srv.Close()
+	if got := readAll(t, srv.URL+"/couponbase1.gz?X-Amz-Signature=abc"); got != "ABCDEFGH\n" {
+		t.Fatalf("got %q", got)
 	}
 }

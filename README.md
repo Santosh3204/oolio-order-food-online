@@ -11,11 +11,12 @@ scalable promo-code (coupon) validation pipeline.
 4. [What each file does](#4-what-each-file-does)
 5. [Coupons: fetching, architecture, file sizes](#5-coupons-fetching-architecture-file-sizes)
 6. [API reference](#6-api-reference)
-7. [Scalability analysis](#7-scalability-analysis)
-8. [Running the tests](#8-running-the-tests)
-9. [The three servers in docker-compose](#9-the-three-servers-in-docker-compose)
-10. [Configuration reference](#10-configuration-reference)
-11. [Troubleshooting and assumptions](#11-troubleshooting-and-assumptions)
+7. [Benchmarks](#7-benchmarks)
+8. [Scalability analysis](#8-scalability-analysis)
+9. [Running the tests](#9-running-the-tests)
+10. [The three servers in docker-compose](#10-the-three-servers-in-docker-compose)
+11. [Configuration reference](#11-configuration-reference)
+12. [Troubleshooting and assumptions](#12-troubleshooting-and-assumptions)
 
 ---
 
@@ -92,6 +93,18 @@ characters **and** it appears in **at least two of three** huge coupon files (~2
 
 **Prerequisites:** Go 1.25+, `make`. Optional: Node 22+ (frontend dev), Docker + Docker Compose (full stack).
 
+### Fastest start: one command, no downloads
+
+```bash
+make demo         # tiny generated coupon files -> index -> API -> 15 end-to-end checks -> stop
+make quickstart   # same, but leaves the API running on :8080 (then `make smoke`, `make loadtest`)
+```
+
+`scripts/gen-sample.sh` writes three small `.gz` files (valid, single-file and too-short codes),
+`scripts/demo.sh` builds the index from them and starts the API, and `scripts/smoke.sh` checks status codes
+for products, auth, validation and every coupon case. `BASE_URL` / `API_KEY` can point it at any running API
+(including the Docker stack).
+
 ### Option A: Go only (simplest)
 
 ```bash
@@ -166,7 +179,7 @@ curl -X POST localhost:8080/api/order -H 'api_key: apitest' -H 'Content-Type: ap
 | File | Purpose |
 |---|---|
 | `coupon.go` | Constants `MinLen=8`, `MaxLen=10`, `MinFiles=2`. Interfaces: `Index` (`Contains`), `Checker` (`Check`), `Validator`, and `Source`. `LengthOK` pre-filter, `ErrNotReady`. |
-| `source.go` | `FileSource` opens a path or URL and transparently gunzips `.gz`. `resumeReader` resumes dropped downloads with `Range` requests; the HTTP client bounds connection setup but has no overall timeout (downloads are GBs). |
+| `source.go` | `FileSource` opens a path or URL and decompresses via a pluggable codec registry (`.gz`, `.zst`, `.bz2`; `RegisterCodec` adds more). `resumeReader` resumes dropped downloads with `Range` requests; the HTTP client bounds connection setup but has no overall timeout (downloads are GBs). |
 | `indexer.go` | `BuildIndex`: phase 1 spills codes of valid length into partition files, phase 2 reduces partitions in parallel using a `code -> (last source, count)` map and keeps codes present in >= `MinFiles` sources. Any number of sources (up to 65,535). Spill writes are buffered per partition within a memory budget and flushed with open-append-close, so no file descriptors stay open. Finished sources and partitions are committed atomically, so a failed build resumes. `workdir.go` adds leased claims so several processes can share a build. |
 | `memory_index.go` | `MemoryIndex` (map-backed set), `SaveIndexFile` (atomic write) and `LoadIndexFile` (path or URL). |
 | `redis_index.go` | `RedisIndex`: `Save` (temp key + `RENAME`), `Contains` (`SISMEMBER`), `Exists`, `Snapshot` (copy the set into memory if it has at most `MaxSnapshot` = 1M codes). |
@@ -285,6 +298,11 @@ OFFLINE  couponindex job                              ONLINE  API replicas (stat
   `false` in production so only the indexer job builds (otherwise every replica would).
 
 ### Extending
+- **New compression format**: register a codec, no change to the indexer:
+  `coupon.RegisterCodec(".xz", func(r io.Reader) (io.ReadCloser, error) { ... })`. `.gz`, `.zst` and `.bz2` are
+  built in, chosen by file extension (query strings of pre-signed URLs are ignored); anything else is plain text.
+- **New input location** (S3 SDK, database cursor, stdin): a `Source` is just `func() (io.ReadCloser, error)`.
+- **New index store** (SQL, DynamoDB...): implement `Index.Contains`; `publish`/`Open` pick the store by config.
 - New rule (different length or file count): constants in `pkg/coupon/coupon.go`.
 - Discounts: add a pricing step after validation. The spec's `Order` has no price fields, so a valid coupon is
   currently only validated, not applied.
@@ -420,7 +438,54 @@ curl -i -X POST http://localhost:8080/api/order -H 'api_key: apitest' -H 'Conten
 
 ---
 
-## 7. Scalability analysis
+## 7. Benchmarks
+
+Measured on the dev machine (WSL2, 18 logical CPUs, Go 1.25). Reproduce with the make targets shown.
+
+| What | Command | Result |
+|---|---|---|
+| Coupon lookup (hot path) | `make bench` | **2.8 ns/op, 0 B/op, 0 allocs/op** (parallel, in-memory index) |
+| HTTP `POST /api/order` with a coupon, 64 concurrent clients, 5 s | `make loadtest` (API running) | **~43.7k req/s**, p50 **0.96 ms**, p90 3.2 ms, p99 5.7 ms, 0 errors (rate limit raised for the test) |
+| Build 3 x 1M codes (3M input, 1M valid), 16 partitions | `make bench-build` | 0.67 s, 4.5 M codes/s, peak heap **56 MB** |
+| Build 3 x 1M codes, 64 partitions | `make bench-build` | 0.57 s, 5.3 M codes/s, peak heap **66 MB** |
+| Build 3 x 5M codes (15M input, 5M valid), 16 partitions | `BENCH_CODES=5000000 make bench-build` | 3.4 s, 4.5 M codes/s, peak heap 336 MB |
+| Build 3 x 5M codes, 64 partitions | `BENCH_CODES=5000000 make bench-build` | 2.8 s, 5.3 M codes/s, peak heap 316 MB |
+
+Notes, honestly read:
+
+- Input here is generated and streamed (nothing preloaded), so time is CPU + disk spill, not network/gunzip. The
+  real 2.1 GB files are download- and gunzip-bound (about 6-10 min).
+- The synthetic data makes a third of all codes valid, far more than the real data. Peak heap is therefore
+  dominated by holding the *result* (valid codes) for the final sort, plus `workers x total/partitions` reduce
+  entries. Both are independent of how many *invalid* codes are in the input, which are spilled to disk and never held.
+- Raising partitions lowers per-reduce memory and was also faster in these runs; the knob is `COUPON_PARTITIONS`.
+- The 313M-code real run was not benchmarked end to end on this machine; the table above is the measured scaling evidence.
+
+### Why not a database for the build?
+
+A database (Postgres `COPY` + `GROUP BY code HAVING count(DISTINCT file) >= 2`, or Redis) would also work, but
+for a one-off 313M-row dedupe it adds an extra service, write amplification (every invalid code is inserted and
+indexed) and slower ingestion than sequential disk appends. The partitioned spill is the same algorithm a
+database would run internally (hash-partition, then aggregate per partition), without the dependency. A database
+*is* used where it fits: **Redis is the shared store** the API replicas load from, and `Index` is the seam to
+swap in SQL. Design alternatives that were considered and rejected: in-memory sort and merge of whole files
+(memory grows with input), and Bloom filters (false positives would accept invalid coupons).
+
+### Where concurrency is used
+
+| Stage | Concurrency |
+|---|---|
+| Spill (download + gunzip + partition) | up to `COUPON_SOURCE_CONCURRENCY` sources in parallel, bounded buffer budget |
+| Reduce | `COUPON_BUILD_WORKERS` partitions in parallel |
+| Across machines | cooperative build: lease-based claims on sources and partitions |
+| API | stateless replicas; lock-free `atomic.Pointer` index swap for refresh |
+
+Within one source the stream is single-threaded on purpose: the pipeline is bound by network and gunzip, which
+are sequential per stream, and parallelism comes from many sources and partitions instead.
+
+---
+
+## 8. Scalability analysis
 
 | Dimension | Behaviour | Lever |
 |---|---|---|
@@ -440,7 +505,7 @@ curl -i -X POST http://localhost:8080/api/order -H 'api_key: apitest' -H 'Conten
 
 ---
 
-## 8. Running the tests
+## 9. Running the tests
 
 ```bash
 make test                                   # same as: go test ./...
@@ -459,7 +524,7 @@ with the index is reachable on `localhost:6379`.
 
 ---
 
-## 9. The three servers in docker-compose
+## 10. The three servers in docker-compose
 
 `docker-compose.yaml` defines a local "production-shaped" stack. Three services form the coupon/API path
 (`redis`, `indexer`, `api`), and a fourth, `web`, serves the UI.
@@ -487,7 +552,7 @@ the `./data:/data:ro` volume on the indexer.
 
 ---
 
-## 10. Configuration reference
+## 11. Configuration reference
 
 | Env | Default | Meaning |
 |---|---|---|
@@ -513,7 +578,7 @@ the `./data:/data:ro` volume on the indexer.
 
 ---
 
-## 11. Troubleshooting and assumptions
+## 12. Troubleshooting and assumptions
 
 **Troubleshooting**
 

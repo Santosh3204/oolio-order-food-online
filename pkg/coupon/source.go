@@ -1,38 +1,98 @@
 package coupon
 
 import (
+	"compress/bzip2"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/gzip" // drop-in, noticeably faster than compress/gzip
+	"github.com/klauspost/compress/zstd"
 )
 
-// FileSource reads a local path or an http(s) URL; ".gz" is transparently decompressed.
+// FileSource reads a local path or an http(s) URL. The compression format is
+// chosen from the file extension via the codec registry (see RegisterCodec);
+// unknown extensions are read as plain text, one code per line.
 func FileSource(location string) Source {
 	return func() (io.ReadCloser, error) {
 		rc, err := open(location)
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasSuffix(location, ".gz") {
+		codec := codecFor(location)
+		if codec == nil {
 			return rc, nil
 		}
-		gz, err := gzip.NewReader(rc)
+		dec, err := codec(rc)
 		if err != nil {
-			err := rc.Close()
+			_ = rc.Close()
+			return nil, fmt.Errorf("decode %s: %w", location, err)
+		}
+		return &decodedReadCloser{dec: dec, under: rc}, nil
+	}
+}
+
+// Codec wraps a raw byte stream in a decompressor.
+type Codec func(io.Reader) (io.ReadCloser, error)
+
+var (
+	codecMu sync.RWMutex
+	codecs  = map[string]Codec{
+		".gz": func(r io.Reader) (io.ReadCloser, error) { return gzip.NewReader(r) },
+		".zst": func(r io.Reader) (io.ReadCloser, error) {
+			d, err := zstd.NewReader(r)
 			if err != nil {
 				return nil, err
 			}
-			return nil, err
-		}
-		return &gzReadCloser{gz: gz, under: rc}, nil
+			return d.IOReadCloser(), nil
+		},
+		".bz2": func(r io.Reader) (io.ReadCloser, error) { return io.NopCloser(bzip2.NewReader(r)), nil },
 	}
+)
+
+// RegisterCodec plugs in support for another compression format (extension
+// including the dot, e.g. ".xz") without touching the indexing code.
+func RegisterCodec(ext string, c Codec) {
+	codecMu.Lock()
+	defer codecMu.Unlock()
+	codecs[strings.ToLower(ext)] = c
+}
+
+// codecFor picks a codec by the extension of the path (query strings of
+// pre-signed URLs are ignored). nil means plain text.
+func codecFor(location string) Codec {
+	p := location
+	if isURL(location) {
+		if u, err := url.Parse(location); err == nil {
+			p = u.Path
+		}
+	}
+	codecMu.RLock()
+	defer codecMu.RUnlock()
+	return codecs[strings.ToLower(path.Ext(p))]
+}
+
+// decodedReadCloser closes both the decoder and the underlying stream.
+type decodedReadCloser struct {
+	dec   io.ReadCloser
+	under io.Closer
+}
+
+func (d *decodedReadCloser) Read(p []byte) (int, error) { return d.dec.Read(p) }
+func (d *decodedReadCloser) Close() error {
+	derr := d.dec.Close()
+	if uerr := d.under.Close(); uerr != nil {
+		return uerr
+	}
+	return derr
 }
 
 func open(location string) (io.ReadCloser, error) {
@@ -130,20 +190,6 @@ func (r *resumeReader) Close() error { return r.body.Close() }
 type errReader struct{ err error }
 
 func (e errReader) Read([]byte) (int, error) { return 0, e.err }
-
-type gzReadCloser struct {
-	gz    *gzip.Reader
-	under io.Closer
-}
-
-func (g *gzReadCloser) Read(p []byte) (int, error) { return g.gz.Read(p) }
-func (g *gzReadCloser) Close() error {
-	err := g.gz.Close()
-	if err != nil {
-		return err
-	}
-	return g.under.Close()
-}
 
 // Fingerprint identifies the current content of a source (best effort) so a
 // resumed build never reuses spill files made from older data. Local files:

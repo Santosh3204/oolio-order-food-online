@@ -144,3 +144,26 @@ func (g *gzReadCloser) Close() error {
 	}
 	return g.under.Close()
 }
+
+// Fingerprint identifies the current content of a source (best effort) so a
+// resumed build never reuses spill files made from older data. Local files:
+// size + mtime. URLs: HEAD length/ETag/Last-Modified. Unknown -> "".
+func Fingerprint(loc string) string {
+	if isURL(loc) {
+		req, err := http.NewRequest(http.MethodHead, loc, nil)
+		if err != nil {
+			return ""
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return ""
+		}
+		_ = resp.Body.Close()
+		return fmt.Sprintf("%d|%s|%s|%d", resp.ContentLength, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), resp.StatusCode)
+	}
+	st, err := os.Stat(loc)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d|%d", st.Size(), st.ModTime().UnixNano())
+}

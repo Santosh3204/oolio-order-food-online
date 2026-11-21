@@ -60,6 +60,11 @@ var (
 //	COUPON_BUILD_WORKERS partitions reduced in parallel    (default min(4, CPUs))
 //	COUPON_REFRESH_SECONDS reload the index this often     (default 60, 0 = never)
 //	COUPON_AUTOBUILD    API builds a missing index itself  (default true; set false in prod)
+//	COUPON_SOURCE_CONCURRENCY sources streamed at once     (default 4)
+//	COUPON_SPILL_MEMORY_MB spill buffer budget             (default 256)
+//	COUPON_RESUME       resume a failed build              (default true)
+//	COUPON_COOPERATIVE  several processes share the build  (default false; needs shared COUPON_TMP_DIR)
+//	COUPON_BUILD_ID     cooperative: id of this run        (change per scheduled run)
 func CouponConfig() coupon.Config {
 	var sources []string
 	for _, s := range strings.Split(getenv("COUPON_FILES", defaultCouponFiles), ",") {
@@ -79,5 +84,11 @@ func CouponConfig() coupon.Config {
 		Workers:       getenvInt("COUPON_BUILD_WORKERS", min(4, runtime.NumCPU())),
 		Refresh:       time.Duration(getenvIntAllowZero("COUPON_REFRESH_SECONDS", 60)) * time.Second,
 		AutoBuild:     getenv("COUPON_AUTOBUILD", "true") != "false",
+
+		SourceConcurrency: getenvInt("COUPON_SOURCE_CONCURRENCY", 4),
+		SpillMemoryMB:     getenvInt("COUPON_SPILL_MEMORY_MB", 256),
+		Resume:            getenv("COUPON_RESUME", "true") != "false",
+		Cooperative:       getenv("COUPON_COOPERATIVE", "false") == "true",
+		BuildID:           os.Getenv("COUPON_BUILD_ID"),
 	}
 }

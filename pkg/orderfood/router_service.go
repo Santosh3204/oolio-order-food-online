@@ -32,9 +32,9 @@ func clientKey(trustProxy bool) func(*fiber.Ctx) string {
 	}
 }
 
-// orderLimiter limits POST /order per client; it runs before auth so floods
+// OrderLimiter limits POST /order per client; it runs before auth so floods
 // and coupon-guessing are throttled whether or not the key is valid.
-func orderLimiter(perMin int, trustProxy bool) fiber.Handler {
+func OrderLimiter(perMin int, trustProxy bool) fiber.Handler {
 	return limiter.New(limiter.Config{
 		Max:          perMin,
 		Expiration:   time.Minute,
@@ -50,7 +50,7 @@ func (r *RouterService) AddRoutes(app fiber.Router) {
 	app.Get("/product", r.client.ProductService.listProducts)
 	app.Get("/product/:productId", r.client.ProductService.getProduct)
 	app.Post("/order",
-		orderLimiter(config.RateLimitPerMin, config.RateLimitTrustProxy),
+		OrderLimiter(config.RateLimitPerMin, config.RateLimitTrustProxy),
 		r.client.AuthService.apiKeyValidator,
 		r.client.OrderService.placeOrder)
 }

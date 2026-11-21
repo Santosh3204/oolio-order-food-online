@@ -1,66 +1,269 @@
 # Order Food Online API (Go)
 
-Implementation of the OpenAPI 3.1 spec in `api/openapi.yaml` using Go + Fiber.
+Implementation of the OpenAPI 3.1 spec in `api/openapi.yaml` using Go + Fiber, with a React frontend and a
+scalable promo-code (coupon) validation pipeline.
 
-## Run
+## Table of contents
+
+1. [Approach and challenges](#1-approach-and-challenges)
+2. [Project structure](#2-project-structure)
+3. [Setting up a local server](#3-setting-up-a-local-server)
+4. [What each file does](#4-what-each-file-does)
+5. [Coupons: fetching, architecture, file sizes](#5-coupons-fetching-architecture-file-sizes)
+6. [API reference](#6-api-reference)
+7. [Scalability analysis](#7-scalability-analysis)
+8. [Running the tests](#8-running-the-tests)
+9. [The three servers in docker-compose](#9-the-three-servers-in-docker-compose)
+10. [Configuration reference](#10-configuration-reference)
+11. [Troubleshooting and assumptions](#11-troubleshooting-and-assumptions)
+
+---
+
+## 1. Approach and challenges
+
+**The task.** Implement the food-ordering API from `api/openapi.yaml` (list/get products, place an order with an
+optional promo code). The hard part is promo-code validation: a code is valid only if its length is 8-10
+characters **and** it appears in **at least two of three** huge coupon files (~2.1 GB compressed, ~313M codes).
+
+**Approach.** Split the problem into a heavy *offline* job and a light *online* path:
+
+- **Offline (`cmd/couponindex`)**: stream the three files once, compute the exact set of valid codes, and publish
+  that tiny result (it is only a handful of codes for the real data) to a shared store.
+- **Online (the API)**: never reads the big files. A request is a length check plus a lookup in an in-memory set.
+
+**Challenges and how they were solved**
+
+| Challenge | Solution |
+|---|---|
+| Files are far too big to hold in memory (~313M codes) | External hash-partition job: spill every code to one of `P` disk partitions by `FNV(code) % P`, then reduce one partition at a time. Peak RAM is about `workers x total/P` entries, not the whole dataset. |
+| Answer must be exact (no false positives) | No Bloom filters or stored hashes. Equal codes always land in the same partition, where a `code -> (last source, distinct count)` map counts distinct sources exactly. A code repeated inside one file counts once. |
+| Multi-GB downloads over flaky networks / DNS (VPN, WSL, Docker Desktop) | `resumeReader` reconnects with an HTTP `Range` request from the last received byte, with exponential backoff (up to ~15 min of outage). |
+| Slow gzip decompression | `klauspost/compress/gzip` (drop-in, faster than the stdlib). All three sources are streamed concurrently. |
+| Many API replicas must not each process the big files | One indexer publishes to Redis (or an index file); replicas only load the small result. |
+| Redis latency or outage must not hurt orders | Each API instance copies the valid set into memory (~14 ns lookup, 0 allocations) and refreshes it periodically. A failed refresh keeps the last good index. |
+| Index published while replicas read it | Redis: written to a temp key then `RENAME`d atomically. File: written to `.tmp` then renamed. Readers never see a partial index. |
+| API should start even before the index exists | Non-blocking start: the API loads the index in the background; orders with a coupon get `503` until it is ready, orders without one are unaffected. |
+| Coupon-code guessing / floods | Per-client rate limit on `POST /order` (runs before auth), spoof-resistant `X-Forwarded-For` handling. |
+
+---
+
+## 2. Project structure
 
 ```
-make run                 # local, port 8080
-docker compose up --build
-make test
+.
+├── main.go                      API entry point (Fiber app, logging, routes under /api)
+├── cmd/
+│   └── couponindex/main.go      OFFLINE job: builds the coupon index and publishes it
+├── pkg/
+│   ├── config/config.go         env-var configuration (server, API key, rate limit, coupon settings)
+│   ├── coupon/                  promo-code validation
+│   │   ├── coupon.go            rules (MinLen/MaxLen/MinFiles) + Index / Checker / Source interfaces
+│   │   ├── source.go            FileSource: local path or http(s) URL, .gz, resumable downloads
+│   │   ├── indexer.go           BuildIndex: spill + reduce external hash-partition algorithm
+│   │   ├── memory_index.go      in-memory set + index file save/load (atomic)
+│   │   ├── redis_index.go       Redis SET store: Save (atomic RENAME), Contains, Snapshot
+│   │   ├── service.go           Config, Build, Open, Service (background load + refresh, Check)
+│   │   └── workdir.go           leased claims + phase runner (resume / cooperative builds)
+│   ├── orderfood/               HTTP layer
+│   │   ├── client.go            wires the services together
+│   │   ├── router_service.go    routes + rate limiter
+│   │   ├── product_service.go   GET /product, GET /product/:id (in-memory catalog)
+│   │   ├── order_service.go     POST /order
+│   │   ├── auth_service.go      api_key header validation
+│   │   ├── errors.go            JSON error helper
+│   └── orderfoodtypes/types.go  request/response models
+├── test/                        all tests (external packages, exported API only)
+│   ├── coupon/                  index build, resume, cooperative, source and benchmark tests
+│   └── orderfood/api_test.go    endpoint + rate-limit tests
+├── api/openapi.yaml             the API specification
+├── web/                         React + Vite frontend (served by nginx in docker)
+│   ├── src/{App.jsx,api.js,main.jsx,styles.css}
+│   ├── nginx.conf               serves the build, proxies /api to the API
+│   └── Dockerfile
+├── Dockerfile                   builds the API and indexer binaries (distroless image)
+├── docker-compose.yaml          redis + indexer + api + web
+├── Makefile                     run / index / test / docker helpers
+└── data/                        (generated) coupon-index.txt and spill files; not committed
 ```
 
-Config (env): `SERVER_PORT` (8080), `API_KEY` (apitest); coupon settings are listed below.
+---
 
+## 3. Setting up a local server
+
+**Prerequisites:** Go 1.25+, `make`. Optional: Node 22+ (frontend dev), Docker + Docker Compose (full stack).
+
+### Option A: Go only (simplest)
+
+```bash
+make run          # API on http://localhost:8080
 ```
+
+The first start has no coupon index, so (with the default `COUPON_AUTOBUILD=true`) the API downloads the three
+files and builds `data/coupon-index.txt` itself. That takes roughly 10 minutes; later starts are instant.
+Until it finishes, products and coupon-less orders work, and orders with a coupon return `503`.
+
+To build the index separately first (recommended):
+
+```bash
+make index        # offline job -> data/coupon-index.txt
+make run
+```
+
+### Option B: with the React UI
+
+```bash
+make run                            # terminal 1: API on :8080
+make web-install && make web-dev    # terminal 2: UI on http://localhost:5173
+```
+
+The UI calls relative `/api/...` URLs; Vite (dev) and nginx (docker) proxy them to the API, so no CORS config is
+needed. The API key defaults to `apitest` (`VITE_API_KEY` overrides it at build time). The spec has no
+"validate coupon" endpoint, so **Apply** only checks the format (8-10 letters/digits); the server verifies the
+code when the order is placed.
+
+### Option C: full stack in Docker (production-shaped)
+
+```bash
+make docker-all          # redis -> build index into redis (~6-10 min) -> api + web
+# UI: http://localhost:3000    API: http://localhost:8080
+```
+
+Or step by step:
+
+```bash
+docker compose up -d redis
+docker compose --profile index run --rm indexer     # one-shot job
+docker compose up -d --build api web
+```
+
+Other helpers: `make docker-logs`, `make docker-down` (keeps volumes), `make docker-clean` (deletes volumes).
+
+### Quick smoke test
+
+```bash
 curl localhost:8080/api/product
 curl localhost:8080/api/product/1
 curl -X POST localhost:8080/api/order -H 'api_key: apitest' -H 'Content-Type: application/json' \
   -d '{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":2}]}'
 ```
 
-## Frontend (React)
+---
 
-`web/` is a small React + Vite app: browse the menu, build a cart, add a promo code, place the order.
+## 4. What each file does
 
-```
-make run          # terminal 1: API on :8080
-make web-install && make web-dev    # terminal 2: UI on http://localhost:5173
-# or, with docker: make docker-all  -> UI on http://localhost:3000
-```
-
-The UI calls relative `/api/...` URLs; Vite (dev) and nginx (docker) proxy them to the API, so no CORS
-config is needed. The API key defaults to `apitest` (`VITE_API_KEY` to override at build time).
-The spec has no "validate coupon" endpoint, so **Apply** only checks the format (8-10 letters/digits);
-the server verifies the code when the order is placed, and a rejected code is shown next to the input
-with the cart kept intact.
-
-## Status codes
-
-| Endpoint | Codes |
+### Entry points
+| File | Purpose |
 |---|---|
-| `GET /api/product` | 200 |
-| `GET /api/product/{id}` | 200, 400 (non-integer id), 404 |
-| `POST /api/order` | 200, 400 (bad JSON / `items` missing), 401 (no `api_key`), 403 (wrong key), 422 (empty items, qty ≤ 0, unknown product, invalid coupon), 503 (coupon index still loading) |
+| `main.go` | Creates the Fiber app with `recover` and request `logger` middleware, builds the `Client`, mounts routes under `/api`, listens on `SERVER_ADDRESS:SERVER_PORT`. |
+| `cmd/couponindex/main.go` | The offline job. Reads config, calls `coupon.Build`, logs how many valid codes were published. Exits non-zero on failure. |
 
-## Layout
+### `pkg/config`
+| File | Purpose |
+|---|---|
+| `config.go` | Reads env vars with defaults: server address/port, `API_KEY`, rate-limit settings, and `CouponConfig()` for all `COUPON_*` settings (default sources are the three challenge S3 files). |
 
-```
-main.go                 wiring / server
-pkg/config              env config
-pkg/orderfood           handlers: product, order, auth, router (+ Client wiring)
-pkg/orderfoodtypes      request/response models
-pkg/coupon              promo-code validation: indexer, memory/redis index, service
-cmd/couponindex         offline job that builds the coupon index
-web/                    React frontend (Vite)
-```
+### `pkg/coupon`
+| File | Purpose |
+|---|---|
+| `coupon.go` | Constants `MinLen=8`, `MaxLen=10`, `MinFiles=2`. Interfaces: `Index` (`Contains`), `Checker` (`Check`), `Validator`, and `Source`. `LengthOK` pre-filter, `ErrNotReady`. |
+| `source.go` | `FileSource` opens a path or URL and transparently gunzips `.gz`. `resumeReader` resumes dropped downloads with `Range` requests; the HTTP client bounds connection setup but has no overall timeout (downloads are GBs). |
+| `indexer.go` | `BuildIndex`: phase 1 spills codes of valid length into partition files, phase 2 reduces partitions in parallel using a `code -> (last source, count)` map and keeps codes present in >= `MinFiles` sources. Any number of sources (up to 65,535). Spill writes are buffered per partition within a memory budget and flushed with open-append-close, so no file descriptors stay open. Finished sources and partitions are committed atomically, so a failed build resumes. `workdir.go` adds leased claims so several processes can share a build. |
+| `memory_index.go` | `MemoryIndex` (map-backed set), `SaveIndexFile` (atomic write) and `LoadIndexFile` (path or URL). |
+| `redis_index.go` | `RedisIndex`: `Save` (temp key + `RENAME`), `Contains` (`SISMEMBER`), `Exists`, `Snapshot` (copy the set into memory if it has at most `MaxSnapshot` = 1M codes). |
+| `service.go` | `Config`; `Build` (sources -> `BuildIndex` -> publish); `Open` (load the published index); `Service` (starts serving immediately, loads the index in the background, optionally auto-builds it, refreshes every `COUPON_REFRESH_SECONDS`, keeps the last good index on failure). |
+| `workdir.go` | Leased `Claim` (heartbeat-renewed claim files, tunable `ClaimLease` / `ClaimPoll`) and `runPhase`, which runs spill/reduce work with a concurrency cap and, in cooperative mode, lets several processes share it. |
 
-## Coupon validation
+### `pkg/orderfood`
+| File | Purpose |
+|---|---|
+| `client.go` | Wires `ProductService`, `OrderService`, `AuthService`, `RouterService`. `NewClientWithCoupons` lets tests inject a fake checker. |
+| `router_service.go` | Registers routes; `orderLimiter` rate-limits `POST /order` per client before auth. |
+| `product_service.go` | In-memory sample catalog (6 products) and the two product handlers. |
+| `order_service.go` | `POST /order`: parse body, validate items, check coupon, validate each product, return the order with a random ID. |
+| `auth_service.go` | Validates the `api_key` header using a constant-time compare: missing key -> 401, wrong key -> 403. |
+| `errors.go` | `sendError` writes the JSON error body and logs it. |
+
+### `pkg/orderfoodtypes`
+| File | Purpose |
+|---|---|
+| `types.go` | `Product`, `OrderItem`, `OrderReq`, `Order`, `ApiResponse` JSON models. |
+
+### Frontend, infrastructure
+| File | Purpose |
+|---|---|
+| `web/src/App.jsx`, `api.js` | Menu, cart, promo-code input, place-order flow; thin fetch wrapper for `/api`. |
+| `web/nginx.conf` | Serves the React build, proxies `/api/` to `api:8080`, forwards `X-Forwarded-For`, and enables underscore headers so `api_key` is not dropped. |
+| `Dockerfile` | Multi-stage build of `/server` and `/couponindex` into a distroless image. |
+| `docker-compose.yaml` | The four services described in [section 9](#9-the-three-servers-in-docker-compose). |
+| `Makefile` | Shortcuts for run, index, build, test, frontend and docker workflows. |
+| `api/openapi.yaml` | The source-of-truth API spec. |
+
+---
+
+## 5. Coupons: fetching, architecture, file sizes
+
+### Rule
 
 A code is valid if its length is 8-10 **and** it appears in at least two of the three coupon files.
 
-The files are ~2.1 GB compressed / ~340M codes, so the design separates a heavy **offline** job from
-a light **online** path:
+### Source files
+
+| File | Compressed size | Codes of valid length (8-10) |
+|---|---|---|
+| `couponbase1.gz` | 655,069,725 B (~625 MiB) | 107,260,777 |
+| `couponbase2.gz` | 729,014,156 B (~695 MiB) | 107,260,776 |
+| `couponbase3.gz` | 737,687,803 B (~703 MiB) | 98,566,152 |
+| **Total** | **~2.12 GB** | **313,087,705** |
+
+Hosted at `https://orderfoodonline-files.s3.ap-southeast-2.amazonaws.com/couponbase{1,2,3}.gz`.
+Compressed sizes are the `Content-Length` reported by S3. Code counts are the exact numbers logged by a real
+indexer run (`source N spilled (...)`, in the order of `COUPON_FILES`); lines outside 8-10 characters are not
+counted. The file format is plain text, one code per line, gzip-compressed. The real data yields only a handful of valid codes (8).
+
+### How valid coupons are fetched (offline build)
+
+```
+couponbase1.gz ─┐
+couponbase2.gz ─┼─ stream concurrently, gunzip ─▶ drop lines not 8-10 chars
+couponbase3.gz ─┘                                   │
+                                                    ▼  spill: FNV-1a(code) % P
+                              disk partitions p0000-s00 … p0063-s02   (P=64 by default)
+                                                    │
+                                                    ▼  reduce, `workers` partitions at a time
+                      map[code] -> (last source, count); keep if count >= 2
+                                                    │
+                                                    ▼  sort + publish atomically
+                                  Redis SET `coupons:valid`   or   data/coupon-index.txt
+```
+
+1. **Open**: `FileSource` opens each location (local path or URL, `.gz` decompressed). URL downloads resume
+   automatically after network drops.
+2. **Spill**: each source is read once, line by line. Lines outside 8-10 characters are skipped. Each remaining
+   code is buffered and appended to `s<source>/p<partition>` for its hash. Each source is written to a private
+   directory that is renamed into place when complete, so a half-spilled source is never mistaken for a finished one.
+   At most `COUPON_SOURCE_CONCURRENCY` sources stream at once.
+3. **Reduce**: for a partition, the sources are read in order into a `map[string]{last source, count}`; a code
+   is counted once per source. Codes with `count >= MinFiles` are valid and written to `r<partition>` atomically,
+   after which that partition's spill files are deleted.
+4. **Publish**: the per-partition results are merged and sorted, then written to the configured store. It is
+   tiny, so this is near-instant.
+
+**Resume.** The work directory is `COUPON_TMP_DIR/couponbuild-<hash of inputs>`. The hash covers the source
+locations, a content fingerprint of each (file size + mtime, or HEAD length/ETag/Last-Modified for URLs) and the
+partition count, so changed files never reuse stale spill data. If a build fails, finished sources and
+partitions are kept and the next run skips them; on success the directory is removed. Set `COUPON_RESUME=false`
+to always start fresh. A lock stops two builds from using the same directory (a stale lock expires after 2 min).
+
+**Distributed / cooperative build.** With `COUPON_COOPERATIVE=true`, several processes or machines that share
+`COUPON_TMP_DIR` (NFS, a shared volume) split the work: each source and partition is claimed with a leased
+claim file (heartbeat-renewed; if a worker dies its claim expires and another takes over). Every participant
+returns the full result and publishes it (publishing is atomic and idempotent). Give every scheduled run a new
+`COUPON_BUILD_ID`, because a cooperative work directory is not deleted afterwards.
+
+Resources for the real input: ~3.5 GB temporary disk and roughly a few hundred MB of reduce RAM per worker with 64 partitions (not measured; raise partitions to lower it), plus the spill buffer budget (`COUPON_SPILL_MEMORY_MB`, 256 MB); about 6-10
+minutes depending on network and CPU.
+
+### Validation architecture (online)
 
 ```
 OFFLINE  couponindex job                              ONLINE  API replicas (stateless)
@@ -69,81 +272,269 @@ OFFLINE  couponindex job                              ONLINE  API replicas (stat
             valid codes --publish atomically--> Index   -> Index.Contains(code)  (memory set or Redis SISMEMBER)
 ```
 
-- **Exact, bounded memory** (`pkg/coupon/indexer.go`): every source is streamed once (concurrently, with
-  the faster `klauspost` gzip) and spilled to `P` partition files by FNV hash. Equal codes always meet in
-  the same partition, so each partition is reduced independently with a `code -> source bitmask` map.
-  No hashes are stored for the answer, so there are **no false positives**; a code repeated inside one
-  file counts once. Peak RAM ~ total/P entries (64 partitions: a few hundred MB); needs ~3.5 GB temp disk.
-  Raise `COUPON_PARTITIONS` to trade disk files for less RAM.
-- **Build once, serve everywhere**: `cmd/couponindex` publishes the tiny result (8 codes for the real
-  data). API replicas only load/query it and never read the big files, so scaling out is free.
-- **Pluggable store** (`Index` interface): `file` (default; path or URL, e.g. an S3/CDN link the job
-  uploads to) or `redis` (shared SET, O(1) `SISMEMBER`; published via temp key + `RENAME` so readers never
-  see a partial index). Adding SQL/DynamoDB = implement `Contains`.
-- **No network on the hot path**: each API instance holds the (tiny) valid set in memory - copied from
-  Redis, or read from the index file - so `Check` is a length test + map lookup (~14 ns, 0 allocs; see
-  `go test ./pkg/coupon -bench .`). Redis is only read at start and on refresh, so a Redis outage or
-  latency spike does not affect orders; the last good index keeps serving. Sets larger than
-  `MaxSnapshot` (1M codes) are queried live in Redis instead.
-- **Self-refreshing**: instances reload the index every `COUPON_REFRESH_SECONDS` (default 60), so a
-  re-run of the indexer is picked up with no restart. A failed refresh keeps the previous index.
-- **Parallel reduce**: `COUPON_BUILD_WORKERS` partitions are reduced at once (peak RAM ~ workers x
-  partition size; raise `COUPON_PARTITIONS` if you raise workers).
-- **Rate limiting**: `POST /order` is limited per client (`RATE_LIMIT_PER_MIN`, default 60) before auth,
-  which also throttles coupon-code guessing; excess requests get 429. Behind a reverse proxy set
-  `RATE_LIMIT_TRUST_PROXY=true` (compose does) so the client address comes from the proxy-appended
-  last `X-Forwarded-For` entry; leave it `false` when exposed directly, otherwise clients could spoof it.
-- **Non-blocking start**: the API serves immediately and picks the index up in the background (polling
-  every 15 s). Orders with a coupon get 503 until it exists; orders without one are unaffected.
-- `COUPON_AUTOBUILD` (default `true`): if no index exists the API builds it itself - handy locally,
-  but set `false` in production so only the indexer job builds (otherwise every replica would).
+- **Pluggable store** (`Index` interface): `file` (default; a path or URL such as an S3/CDN link) or `redis`
+  (shared SET). Adding SQL/DynamoDB means implementing `Contains`.
+- **No network on the hot path**: each API instance holds the valid set in memory (copied from Redis or read
+  from the file), so `Check` is a length test plus a map lookup (~14 ns, 0 allocations). Redis is only read at
+  start-up and on refresh. Sets larger than `MaxSnapshot` (1M codes) are queried live in Redis instead.
+- **Self-refreshing**: instances reload every `COUPON_REFRESH_SECONDS` (default 60); re-running the indexer is
+  picked up with no restart. A failed refresh keeps the previous index.
+- **Non-blocking start**: the API serves immediately and polls for the index every 15 s. Until it exists,
+  orders with a coupon get `503`.
+- **`COUPON_AUTOBUILD`** (default `true`): if no index exists the API builds it itself. Handy locally; set
+  `false` in production so only the indexer job builds (otherwise every replica would).
 
-### Run it
+### Extending
+- New rule (different length or file count): constants in `pkg/coupon/coupon.go`.
+- Discounts: add a pricing step after validation. The spec's `Order` has no price fields, so a valid coupon is
+  currently only validated, not applied.
+- Refresh: re-run the indexer on a schedule; the swap is atomic.
 
-Local, zero setup (first start builds `data/coupon-index.txt`, ~10 min; later starts are instant):
+---
+
+## 6. API reference
+
+Base URL: `http://localhost:8080/api`. Secured endpoints need the header `api_key: apitest` (configurable via
+`API_KEY`). Error bodies share one shape:
+
+```json
+{ "code": 422, "type": "validation", "message": "invalid coupon code" }
 ```
-make run
+
+### Summary
+
+| Method | Path | Auth | Success | Error codes |
+|---|---|---|---|---|
+| GET | `/product` | none | 200 | none |
+| GET | `/product/{productId}` | none | 200 | 400, 404 |
+| POST | `/order` | `api_key` header | 200 | 400, 401, 403, 422, 429, 503 |
+
+### `GET /product`: list products
+
+**Request**: no body.
+
+**Response 200**
+```json
+[
+  { "id": "1", "name": "Chicken Waffle", "price": 12.5, "category": "Waffle" },
+  { "id": "2", "name": "Belgian Waffle", "price": 9, "category": "Waffle" }
+]
 ```
-Production-shaped, locally (Redis + one-shot indexer + stateless API):
+(Six sample products, ids 1-6.)
+
+```bash
+curl -i http://localhost:8080/api/product
 ```
+
+### `GET /product/{productId}`: get one product
+
+**Request**: path parameter `productId` (integer).
+
+| Status | Meaning | Body |
+|---|---|---|
+| 200 | Product found | `{ "id": "1", "name": "Chicken Waffle", "price": 12.5, "category": "Waffle" }` |
+| 400 | `productId` is not an integer | `{ "code":400, "type":"error", "message":"invalid ID supplied" }` |
+| 404 | No such product | `{ "code":404, "type":"error", "message":"product not found" }` |
+
+```bash
+curl -i http://localhost:8080/api/product/1       # 200
+curl -i http://localhost:8080/api/product/abc     # 400
+curl -i http://localhost:8080/api/product/999     # 404
+```
+
+### `POST /order`: place an order
+
+**Headers**: `api_key: apitest`, `Content-Type: application/json`
+
+**Request body**
+```json
+{
+  "couponCode": "HAPPYHRS",
+  "items": [ { "productId": "1", "quantity": 2 } ]
+}
+```
+- `items` (required): array of `{productId: string, quantity: integer > 0}`.
+- `couponCode` (optional): validated as described in [section 5](#5-coupons-fetching-architecture-file-sizes).
+
+**Response 200**
+```json
+{
+  "id": "A1B2-C3D4-E5F6-0718",
+  "items": [ { "productId": "1", "quantity": 2 } ],
+  "products": [ { "id": "1", "name": "Chicken Waffle", "price": 12.5, "category": "Waffle" } ]
+}
+```
+
+| Status | When | `message` |
+|---|---|---|
+| 200 | Order created | n/a (order JSON) |
+| 400 | Body is not valid JSON | `invalid input` |
+| 400 | `items` field missing | `items is required` |
+| 401 | `api_key` header missing | `unauthorized` |
+| 403 | `api_key` wrong | `forbidden` |
+| 422 | `items` is empty | `order must contain at least one item` |
+| 422 | Coupon not valid (bad length, or not in 2+ files) | `invalid coupon code` |
+| 422 | Item has no `productId` | `items[i].productId is required` |
+| 422 | `quantity` <= 0 | `items[i].quantity must be greater than 0` |
+| 422 | Unknown product | `items[i]: product "99" not found` |
+| 429 | Rate limit exceeded (`RATE_LIMIT_PER_MIN`, default 60 per client per minute) | `rate limit exceeded, try again later` |
+| 503 | Coupon index still loading or store unreachable | `coupon service unavailable, retry shortly` |
+
+Note: the rate limiter runs before auth, so a flood gets `429` whether or not the key is valid. The `503` only
+affects orders that include a coupon.
+
+```bash
+# 200: order without coupon
+curl -i -X POST http://localhost:8080/api/order \
+  -H 'api_key: apitest' -H 'Content-Type: application/json' \
+  -d '{"items":[{"productId":"1","quantity":2}]}'
+
+# 200 / 422: order with a coupon (HAPPYHRS is only valid if it is in the built index)
+curl -i -X POST http://localhost:8080/api/order \
+  -H 'api_key: apitest' -H 'Content-Type: application/json' \
+  -d '{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":2}]}'
+
+# 401: no api_key
+curl -i -X POST http://localhost:8080/api/order -H 'Content-Type: application/json' \
+  -d '{"items":[{"productId":"1","quantity":1}]}'
+
+# 403: wrong api_key
+curl -i -X POST http://localhost:8080/api/order -H 'api_key: wrong' -H 'Content-Type: application/json' \
+  -d '{"items":[{"productId":"1","quantity":1}]}'
+
+# 400: malformed JSON
+curl -i -X POST http://localhost:8080/api/order -H 'api_key: apitest' -H 'Content-Type: application/json' -d '{'
+
+# 422: empty items
+curl -i -X POST http://localhost:8080/api/order -H 'api_key: apitest' -H 'Content-Type: application/json' \
+  -d '{"items":[]}'
+
+# 422: unknown product
+curl -i -X POST http://localhost:8080/api/order -H 'api_key: apitest' -H 'Content-Type: application/json' \
+  -d '{"items":[{"productId":"99","quantity":1}]}'
+
+# 422: invalid coupon
+curl -i -X POST http://localhost:8080/api/order -H 'api_key: apitest' -H 'Content-Type: application/json' \
+  -d '{"couponCode":"SUPER100","items":[{"productId":"1","quantity":1}]}'
+```
+
+---
+
+## 7. Scalability analysis
+
+| Dimension | Behaviour | Lever |
+|---|---|---|
+| **Index build time** | Linear in input size; network and gunzip bound. Up to `COUPON_SOURCE_CONCURRENCY` sources stream in parallel (default 4, capped so many large files do not fight over bandwidth/disk). Roughly 6-10 min for ~2.1 GB. | Faster network; run the job close to the S3 region; raise the concurrency if bandwidth allows; use the cooperative build to add machines. |
+| **Build memory** | Reduce: `workers x (total codes / partitions)` map entries, independent of input size. Spill: a fixed buffer budget (`COUPON_SPILL_MEMORY_MB`) split over `partitions x concurrent sources`, so it no longer grows with the partition or source count. | Raise `COUPON_PARTITIONS` or lower `COUPON_BUILD_WORKERS`. |
+| **Build disk** | About the uncompressed size of valid-length codes (~3.5 GB here), freed partition by partition. | Point `COUPON_TMP_DIR` at a larger volume. |
+| **Number of files / file descriptors** | Up to 65,535 sources. No descriptors stay open while spilling (open-append-close per flush) and the reduce opens one file at a time, so `partitions x sources` does not hit `ulimit -n`. | n/a |
+| **Failures during a long build** | Progress is checkpointed per source and per partition; a re-run resumes instead of re-downloading everything. | `COUPON_RESUME=false` to force a clean build. |
+| **Single machine ceiling** | The cooperative build splits sources and partitions across processes/machines that share `COUPON_TMP_DIR`. The shared volume's throughput becomes the limit. | `COUPON_COOPERATIVE=true`, same `COUPON_BUILD_ID` on every node. |
+| **Request latency** | Length check + in-memory map lookup: ~14 ns, 0 allocations. No I/O per request. | n/a |
+| **API throughput** | Stateless replicas; each holds its own copy of the tiny valid set, so throughput scales linearly with replicas behind a load balancer. | `docker compose up -d --scale api=N` (remove the fixed host port first). |
+| **Index size growth** | Up to `MaxSnapshot` (1M codes) it is copied to every instance's memory (a few tens of MB). Beyond that, the API falls back to live Redis `SISMEMBER` (O(1), one network hop). | Raise `MaxSnapshot` or move to a Bloom filter + Redis for very large sets. |
+| **Redis as dependency** | Needed only at start-up and refresh, not per request, so an outage or latency spike does not affect orders. | Redis replication/Sentinel for the indexer-write path. |
+| **Index freshness** | Replicas reload every `COUPON_REFRESH_SECONDS`; publishing is atomic. | Run the indexer on a schedule; lower the refresh interval. |
+| **Abuse** | `POST /order` is rate-limited per client (default 60/min), which also throttles coupon guessing. | Tune `RATE_LIMIT_PER_MIN`. The limiter is per instance and in memory, so with N replicas the effective limit is up to N times higher; use a shared limiter store for a strict global limit. |
+| **Known limits** | Product catalog is in memory and order IDs are not persisted (single-node demo). | Add a database for products and orders. |
+
+---
+
+## 8. Running the tests
+
+```bash
+make test                                   # same as: go test ./...
+go test ./... -race -count=1                # race detector, no cache
+go test ./test/coupon -run TestBuildIndex -v # a single test
+go test ./test/coupon -bench . -benchmem     # benchmarks
+```
+
+| Package | Tests |
+|---|---|
+| `test/coupon` | `TestBuildIndex` (2-of-3 rule and length filter), `TestSameFileTwiceDoesNotCount`, `TestIndexFileRoundTripAndService`, `TestBuildAutoPublishesFile`, `TestServiceRefreshPicksUpNewIndexAndKeepsLastGoodOnFailure`, `TestResumeAfterDroppedConnection` |; indexer: `TestManySources` (100 sources), `TestTinyBudgetManyPartitions`, `TestSourceConcurrencyIsCapped`, `TestResumeSkipsFinishedSources`, `TestNoResumeStartsFresh`, `TestConcurrentBuildSameKeyIsRejected`, `TestCooperativeBuild`, `TestStaleClaimIsTakenOver`, `TestCooperativeNeedsKey` |
+| `test/orderfood` | `TestAPI` (every endpoint and status code, using a fake coupon validator) and `TestOrderRateLimit` (429 behaviour, spoofed `X-Forwarded-For` has no effect) |
+
+The tests live in `test/` as external packages (exported API only, which is why `Service.SetIndex`, `Claim` and `OrderLimiter` are exported). They need no network, Redis or large files. `BenchmarkCheckRedis` is skipped automatically unless a Redis
+with the index is reachable on `localhost:6379`.
+
+---
+
+## 9. The three servers in docker-compose
+
+`docker-compose.yaml` defines a local "production-shaped" stack. Three services form the coupon/API path
+(`redis`, `indexer`, `api`), and a fourth, `web`, serves the UI.
+
+| Service | Role | Lifetime | Notes |
+|---|---|---|---|
+| **`redis`** (`redis:7-alpine`, port 6379) | Shared coupon index store. Holds the SET `coupons:valid` that every API replica reads. | Long-running | The indexer writes via temp key + `RENAME` so readers never see a partial set. |
+| **`indexer`** (built from `Dockerfile`, entrypoint `/couponindex`) | The OFFLINE job: downloads the three big files, runs the spill/reduce build, publishes the valid codes to Redis, then exits. | One-shot, profile `index` (does not start with `docker compose up`) | Uses the `spill` volume for ~3.5 GB of temp data. Run it once, and again whenever the coupon files change (or on a schedule). |
+| **`api`** (built from `Dockerfile`, entrypoint `/server`, port 8080) | The stateless Fiber API. Loads the small index from Redis into memory and serves requests. Never touches the big files. | Long-running, scalable | `COUPON_AUTOBUILD=false` so only the indexer builds; `RATE_LIMIT_TRUST_PROXY=true` because it sits behind nginx. |
+| **`web`** (built from `web/`, port 3000 -> nginx :80) | nginx serving the React build and proxying `/api/` to `api:8080`. | Long-running | Same-origin, so no CORS. |
+
+Flow: `indexer --writes--> redis <--reads at startup/refresh-- api <--proxy-- web <-- browser`.
+
+Typical commands:
+
+```bash
 docker compose up -d redis
-docker compose --profile index run --rm indexer
-docker compose up -d --build api
+docker compose --profile index run --rm indexer     # run the offline job
+docker compose up -d --build api web
 ```
-Offline job only, file store: `make index`.
+
+The `indexer` and `api` share the same environment through a YAML anchor (`COUPON_STORE=redis`,
+`COUPON_REDIS_ADDR=redis:6379`, ...). To use local copies instead of downloading, uncomment `COUPON_FILES` and
+the `./data:/data:ro` volume on the indexer.
+
+---
+
+## 10. Configuration reference
 
 | Env | Default | Meaning |
 |---|---|---|
+| `SERVER_ADDRESS` / `SERVER_PORT` | `0.0.0.0` / `8080` | Listen address |
+| `API_KEY` | `apitest` | Expected `api_key` header value |
+| `RATE_LIMIT_PER_MIN` | `60` | Per-client limit on `POST /order` |
+| `RATE_LIMIT_TRUST_PROXY` | `false` | Trust the last `X-Forwarded-For` entry (set `true` only behind a trusted proxy such as the nginx in compose; otherwise clients could spoof it) |
 | `COUPON_STORE` | `file` | `file` or `redis` |
-| `COUPON_INDEX` | `data/coupon-index.txt` | file store path or URL |
-| `COUPON_REDIS_ADDR` / `COUPON_REDIS_KEY` | `localhost:6379` / `coupons:valid` | redis store |
-| `COUPON_FILES` | the 3 challenge S3 files | sources (paths/URLs, `.gz` ok) |
-| `COUPON_TMP_DIR` | `data/tmp` | spill space for the build |
-| `COUPON_PARTITIONS` | `64` | build partitions |
-| `COUPON_AUTOBUILD` | `true` | API builds a missing index itself |
-| `COUPON_BUILD_WORKERS` | `min(4, CPUs)` | partitions reduced in parallel |
-| `COUPON_REFRESH_SECONDS` | `60` | index reload interval (`0` = never) |
-| `RATE_LIMIT_PER_MIN` | `60` | per-client limit on `POST /order` |
-| `RATE_LIMIT_TRUST_PROXY` | `false` | trust the last `X-Forwarded-For` entry |
+| `COUPON_INDEX` | `data/coupon-index.txt` | File store path or URL |
+| `COUPON_REDIS_ADDR` / `COUPON_REDIS_KEY` | `localhost:6379` / `coupons:valid` | Redis store |
+| `COUPON_REDIS_PASSWORD` | empty | Redis password |
+| `COUPON_FILES` | the 3 challenge S3 files | Comma-separated sources (paths/URLs, `.gz` ok) |
+| `COUPON_TMP_DIR` | `data/tmp` | Spill space for the build |
+| `COUPON_PARTITIONS` | `64` | Build partitions (more = less RAM) |
+| `COUPON_BUILD_WORKERS` | `min(4, CPUs)` | Partitions reduced in parallel |
+| `COUPON_REFRESH_SECONDS` | `60` | Index reload interval (`0` = never) |
+| `COUPON_AUTOBUILD` | `true` | API builds a missing index itself (set `false` in prod) |
+| `COUPON_SOURCE_CONCURRENCY` | `4` | Sources downloaded/decompressed at once |
+| `COUPON_SPILL_MEMORY_MB` | `256` | Total spill write-buffer budget |
+| `COUPON_RESUME` | `true` | Resume a failed build from its kept progress |
+| `COUPON_COOPERATIVE` | `false` | Share the build with other processes via `COUPON_TMP_DIR` |
+| `COUPON_BUILD_ID` | empty | Cooperative mode: identifies one run; change it per scheduled run |
 
-### Extending
-- New rule (e.g. different length / file count): constants in `pkg/coupon/coupon.go`.
-- Discounts: a pricing step after validation (the spec's `Order` has no price fields, so a valid
-  coupon is only validated, not applied).
-- Refresh: re-run the indexer on a schedule; the swap is atomic.
+---
 
-## Troubleshooting
+## 11. Troubleshooting and assumptions
 
-- `dial tcp: lookup ...s3... no such host` / `server misbehaving` in the indexer log: a transient DNS or
-  network failure (VPN/WSL/Docker Desktop). Downloads resume automatically from the last byte with
-  exponential backoff (up to ~15 min of outage); no action needed. If it never recovers, set a
-  resolver for the indexer in `docker-compose.yaml` (`dns: ["<your corporate DNS>"]`) or download the
-  files once and point `COUPON_FILES` at local copies.
-- `docker compose build` fails booting `multi-platform-builder`: the Makefile uses buildx's `default`
-  builder; for raw compose commands run `docker buildx use default`.
+**Troubleshooting**
 
-## Assumptions
+- `dial tcp: lookup ...s3... no such host` / `server misbehaving` in the indexer log: a transient DNS or network
+  failure (VPN/WSL/Docker Desktop). Downloads resume automatically from the last byte with exponential backoff
+  (up to ~15 min of outage); no action needed. If it never recovers, set a resolver for the indexer in
+  `docker-compose.yaml` (`dns: ["<your corporate DNS>"]`) or download the files once and point `COUPON_FILES`
+  at local copies.
+- `make docker-up` fails with `lookup registry-1.docker.io: no such host` (or similar for `gcr.io`): Docker Desktop
+  could not resolve the registry (VPN/WSL DNS blip), so base images could not be pulled. Nothing is wrong with the
+  project; check `getent hosts registry-1.docker.io` in WSL, reconnect the VPN or restart Docker Desktop, then run
+  `make docker-up` again (the already-built index in Redis is kept).
+- Indexer logs look older than the code (e.g. `valid so far`): `docker compose run` reuses the existing image. Run
+  `docker compose build indexer api` (or `make docker-build`) after pulling code changes.
+- `docker compose build` fails booting `multi-platform-builder`: the Makefile uses buildx's `default` builder;
+  for raw compose commands run `docker buildx use default`.
+- Orders with a coupon return `503`: the index is not built or loaded yet. Check the API log for
+  `coupon index ready`, or run the indexer.
+
+**Assumptions**
 
 - The spec has no pricing in `Order`, so a valid coupon is only validated, not applied.
 - Product seed data is sample data.
-- Order IDs are random, not guaranteed unique across restarts (no persistence).
+- Order IDs are random and not guaranteed unique across restarts (no persistence).

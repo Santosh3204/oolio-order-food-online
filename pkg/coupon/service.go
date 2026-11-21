@@ -3,6 +3,7 @@ package coupon
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -20,6 +21,12 @@ type Config struct {
 	Workers       int           // partitions reduced in parallel (more = faster, more RAM)
 	Refresh       time.Duration // how often instances reload the index (0 = never)
 	AutoBuild     bool          // API builds the index itself if none exists (local dev); disable in prod
+
+	SourceConcurrency int    // sources downloaded at once (0 = 4)
+	SpillMemoryMB     int    // spill write-buffer budget in MiB (0 = 256)
+	Resume            bool   // reuse spill progress of a failed build with the same inputs
+	Cooperative       bool   // several processes/machines share TmpDir and split the build
+	BuildID           string // cooperative mode: identifies one run (change it per scheduled run)
 }
 
 // RetryDelay is the wait between attempts to find/build the index.
@@ -35,12 +42,36 @@ func Build(cfg Config) (int, error) {
 		sources[i] = FileSource(loc)
 	}
 	start := time.Now()
-	codes, err := BuildIndex(sources, cfg.TmpDir, cfg.Partitions, cfg.Workers)
+	codes, err := BuildIndexOpts(sources, Options{
+		TmpDir:            cfg.TmpDir,
+		Partitions:        cfg.Partitions,
+		Workers:           cfg.Workers,
+		SourceConcurrency: cfg.SourceConcurrency,
+		SpillMemory:       int64(cfg.SpillMemoryMB) << 20,
+		Key:               buildKey(cfg),
+		Resume:            cfg.Resume,
+		Cooperative:       cfg.Cooperative,
+	})
 	if err != nil {
 		return 0, err
 	}
 	log.Printf("coupon indexer: %d valid codes built in %s", len(codes), time.Since(start).Round(time.Second))
 	return len(codes), publish(cfg, codes)
+}
+
+// buildKey identifies the build inputs: locations, their current content
+// fingerprints (so a changed file never reuses stale spill data), partition
+// count, and in cooperative mode the run id.
+func buildKey(cfg Config) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "p=%d;", cfg.Partitions)
+	for _, loc := range cfg.Sources {
+		fmt.Fprintf(&b, "%s|%s;", loc, Fingerprint(loc))
+	}
+	if cfg.Cooperative {
+		fmt.Fprintf(&b, "run=%s;", cfg.BuildID)
+	}
+	return b.String()
 }
 
 func publish(cfg Config, codes []string) error {
@@ -143,6 +174,9 @@ func orDefault(s string) string {
 	}
 	return s
 }
+
+// SetIndex installs idx as the served index (static services, tests, benchmarks).
+func (s *Service) SetIndex(idx Index) { s.idx.Store(&idx) }
 
 // Ready reports whether the index is available.
 func (s *Service) Ready() bool { return s.idx.Load() != nil }

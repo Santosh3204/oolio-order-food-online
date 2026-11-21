@@ -1,7 +1,8 @@
-package orderfood
+package orderfood_test
 
 import (
 	"github.com/Santosh3204/oolio-order-food-online/pkg/coupon"
+	"github.com/Santosh3204/oolio-order-food-online/pkg/orderfood"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -15,7 +16,7 @@ func (fake) IsValid(c string) bool { return c == "HAPPYHRS" }
 
 func newApp() *fiber.App {
 	app := fiber.New()
-	NewClientWithCoupons(coupon.Static{Validator: fake{}}).RouterService.AddRoutes(app.Group("/api"))
+	orderfood.NewClientWithCoupons(coupon.Static{Validator: fake{}}).RouterService.AddRoutes(app.Group("/api"))
 	return app
 }
 
@@ -62,7 +63,7 @@ func TestAPI(t *testing.T) {
 
 func TestOrderRateLimit(t *testing.T) {
 	app := fiber.New()
-	app.Post("/o", orderLimiter(3, true), func(c *fiber.Ctx) error { return c.SendStatus(200) })
+	app.Post("/o", orderfood.OrderLimiter(3, true), func(c *fiber.Ctx) error { return c.SendStatus(200) })
 	hit := func(xff string) int {
 		req := httptest.NewRequest("POST", "/o", nil)
 		req.Header.Set("X-Forwarded-For", xff)

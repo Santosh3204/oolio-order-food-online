@@ -1,7 +1,8 @@
-package coupon
+package coupon_test
 
 import (
 	"fmt"
+	"github.com/Santosh3204/oolio-order-food-online/pkg/coupon"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -43,7 +44,7 @@ func TestResumeAfterDroppedConnection(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rc, err := open(srv.URL)
+	rc, err := coupon.FileSource(srv.URL)()
 	if err != nil {
 		t.Fatal(err)
 	}
